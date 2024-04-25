@@ -32,10 +32,10 @@ def create_1_hop_pattern(
     """
     random.seed(seed)
     # Randomly select all initial entities and relations to be used
-    sampled_entities = entity2id.sample(4, replace=True, random_state=seed)\
-        ['id'].tolist()
-    sampled_relations = relation2id.sample(2, replace=True, random_state=seed)\
-        ['id'].tolist()
+    sampled_entities = entity2id.sample(
+        4, weights='wt', replace=True, random_state=seed)['id'].tolist()
+    sampled_relations = relation2id.sample(
+        2, weights='wt', replace=True, random_state=seed)['id'].tolist()
     # Define antecedent
     antecedent = [
         (
@@ -89,10 +89,10 @@ def create_2_hop_pattern(
     """
     random.seed(seed)
     # Randomly select all initial entities and relations to be used
-    sampled_entities = entity2id.sample(6, replace=True, random_state=seed)\
-        ['id'].tolist()
-    sampled_relations = relation2id.sample(3, replace=True, random_state=seed)\
-        ['id'].tolist()
+    sampled_entities = entity2id.sample(
+        6, weights='wt', replace=True, random_state=seed)['id'].tolist()
+    sampled_relations = relation2id.sample(
+        3, weights='wt', replace=True, random_state=seed)['id'].tolist()
     # Define antecedent
     antecedent = [
         (
@@ -177,10 +177,10 @@ def create_3_hop_pattern(
     """
     random.seed(seed)
     # Randomly select all initial entities and relations to be used
-    sampled_entities = entity2id.sample(8, replace=True, random_state=seed)\
-        ['id'].tolist()
-    sampled_relations = relation2id.sample(4, replace=True, random_state=seed)\
-        ['id'].tolist()
+    sampled_entities = entity2id.sample(
+        8, weights='wt', replace=True, random_state=seed)['id'].tolist()
+    sampled_relations = relation2id.sample(
+        4, weights='wt', replace=True, random_state=seed)['id'].tolist()
     # Third antecedent must intersect at least one prior antecedent
     if ~entities_intersect(sampled_entities[:4], sampled_entities[4:6]):
         # Enforce that the third antecedent include entities from at least one prior

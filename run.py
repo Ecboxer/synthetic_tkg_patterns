@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -14,15 +15,25 @@ from utils import is_subpattern
 
 
 def create_entity2id(config) -> pd.DataFrame:
+    if config['pat_distr_ents']:
+        wts = config['pat_distr_ents'](config['n_ents'])
+    else:
+        wts = [1]*config['n_ents']
     return pd.DataFrame({
         'name': range(config['n_ents']),
         'id': range(config['n_ents']),
+        'wt': wts,
     })
 
 def create_relation2id(config) -> pd.DataFrame:
+    if config['pat_distr_rels']:
+        wts = config['pat_distr_rels'](config['n_rels'])
+    else:
+        wts = [1]*config['n_rels']
     return pd.DataFrame({
         'name': range(config['n_rels']),
         'id': range(config['n_rels']),
+        'wt': wts,
     })
 
 def create_time2id(config) -> pd.DataFrame:
@@ -71,6 +82,56 @@ def add_new_pattern(
             pattern_quadruples.append(quad)
             new_pat = True
         retry += 1
+
+def get_satisfying_idxs(
+    pattern: TemporalPattern, edgelist: pd.DataFrame, prev_t: int = -1,
+    satisfying_idxs: 'List[int]' = [], prev_idxs = [],
+) -> 'List[int]':
+    """ Get ids of triples that satisfy pattern in edgelist
+    """
+    if pattern.n_hops == 0:
+        # Final check for consequence
+        cons = pattern.consequence
+        time_lag = pattern.time_lags[0]
+        triples = edgelist[
+            (edgelist['head'] == cons[0]) &
+            (edgelist['rel'] == cons[1]) &
+            (edgelist['tail'] == cons[2]) &
+            (edgelist['t'] >= prev_t+time_lag[0] if prev_t != -1 else edgelist['t'] > -np.inf) &
+            (edgelist['t'] <= prev_t+time_lag[1] if prev_t != -1 else edgelist['t'] < np.inf)
+        ]
+        if triples.shape[0] > 0:
+            # If some valid consequence is found, return all its satisfying
+            # triples' locations
+            return list(set(satisfying_idxs+prev_idxs+triples.index.tolist()))
+    else:
+        # Otherwise, check first antecedent recursively
+        ante = pattern.antecedent[0]
+        time_lag = pattern.time_lags[0] if prev_t != -1 else None
+        triples = edgelist[
+            (edgelist['head'] == ante[0]) &
+            (edgelist['rel'] == ante[1]) &
+            (edgelist['tail'] == ante[2]) &
+            (edgelist['t'] >= prev_t+time_lag[0] if prev_t != -1 else edgelist['t'] > -np.inf) &
+            (edgelist['t'] <= prev_t+time_lag[1] if prev_t != -1 else edgelist['t'] < np.inf)
+        ]
+        new_idxs = triples.index.tolist()
+        new_satisfying_idxs = []
+        for idx in new_idxs:
+            new_pattern = TemporalPattern(
+                antecedent=list(pattern.antecedent)[1:],
+                consequence=pattern.consequence,
+                time_lags=list(pattern.time_lags)[1:] if prev_t != -1 else list(pattern.time_lags),
+                n_hops=pattern.n_hops-1,
+            )
+            new_satisfying_idxs.extend(get_satisfying_idxs(
+                new_pattern, edgelist,
+                prev_t=edgelist.loc[idx]['t'],
+                satisfying_idxs=satisfying_idxs,
+                prev_idxs=list(set(prev_idxs+[idx])),
+            ))
+        satisfying_idxs.extend(new_satisfying_idxs)
+    return list(set(satisfying_idxs))
 
 def run(config: 'Dict[str,]', run_id: int):
     """ Create TKGs according to configuration from config.py file
@@ -157,7 +218,8 @@ def run(config: 'Dict[str,]', run_id: int):
                     'tail': tails_pat,
                     't': ts_pat,
                     'wt': [1]*len(heads_pat),
-                    'pattern': [[pattern_id]]*len(heads_pat),
+                    'pattern': [[]]*len(heads_pat),
+                    # 'pattern': [[pattern_id]]*len(heads_pat),
                 })
                 edgelist = pd.concat([
                     edgelist,
@@ -207,20 +269,41 @@ def run(config: 'Dict[str,]', run_id: int):
             'tail': tails,
             't': [t]*len(heads),
             'wt': [1]*len(heads),
-            'pattern': pats,
+            'pattern': [[]]*len(heads),
+            # 'pattern': pats,
         })
         edgelist = pd.concat([
             edgelist,
             df_pat,
         ]).reset_index(drop=True)
 
-    # Cut off edgelist at n_tws
+    # Cut off edgelist at n_tws (because forced patterns may have extended past n_tws)
     edgelist = edgelist[edgelist['t'] < config['n_tws']]
     # Aggregate duplicate edges
     edgelist = edgelist.groupby(['head', 'rel', 'tail', 't']).agg({
         'wt': 'sum',
         'pattern': lambda x: sorted(list(set([el for ids in x for el in ids]))),
     }).reset_index().sort_values(['t', 'head', 'tail', 'rel']).reset_index(drop=True)
+    
+    # Post-creation label all valid patterns
+    for label, pattern_id in zip(pattern2id['pattern'], pattern2id['id']):
+        # Instantiate pattern from label
+        pattern = TemporalPattern()
+        pattern.from_label(label)
+
+        satisfying_idxs = get_satisfying_idxs(
+            pattern, edgelist, prev_t=-1, satisfying_idxs=[],
+        )
+        for idx in satisfying_idxs:
+            edgelist.loc[idx]['pattern'].append(pattern_id)
+
+    # Deduplicate patterns
+    edgelist.loc[:,'pattern'] = edgelist['pattern'].apply(lambda x: sorted(list(set(x))))
+    # # Aggregate duplicate edges again to deduplicate patterns
+    # edgelist = edgelist.groupby(['head', 'rel', 'tail', 't']).agg({
+    #     'wt': 'sum',
+    #     'pattern': lambda x: sorted(list(set([el for ids in x for el in ids]))),
+    # }).reset_index().sort_values(['t', 'head', 'tail', 'rel']).reset_index(drop=True)
     edgelist['head'] = edgelist['head'].astype(int)
     edgelist['rel'] = edgelist['rel'].astype(int)
     edgelist['tail'] = edgelist['tail'].astype(int)
@@ -239,8 +322,29 @@ def run(config: 'Dict[str,]', run_id: int):
         os.path.join(export_dir, 'pattern2id.txt'), sep='\t', index=False, header=False)
     with open(os.path.join(export_dir, 'stat.txt'), 'w') as f:
         f.writelines(f'{entity2id.id.nunique()}\t{relation2id.id.nunique()}\t0')
-    edgelist.to_csv(
-        os.path.join(export_dir, 'edgelist.txt'), sep='\t', index=False, header=False)
+    
+    # Temporal Train-Valid-Test split
+    timestamps_unq = pd.Series(edgelist['t'].unique())
+    end_train, end_valid, end_test = \
+        int(timestamps_unq.quantile(config['split'][0])), \
+        int(timestamps_unq.quantile(config['split'][0] + config['split'][1])), \
+        int(timestamps_unq.max())
+    if (end_train == end_valid) and (config['split'][1] != 0):
+        # Allow user to specify 0% validation set
+        raise ValueError(f'Split into train and valid sets failed because of quantile collision: {end_train}')
+    if (end_valid == end_test) and (config['split'][2] != 0):
+        # Allow user to specify 0% test set
+        raise ValueError(f'Split into valid and test sets failed because of quantile collision: {end_valid}')
+    train_df = edgelist[edgelist['t'] <= end_train]
+    valid_df = edgelist[(edgelist['t'] > end_train) & (edgelist['t'] <= end_valid)]
+    test_df = edgelist[edgelist['t'] > end_valid]
+    train_df.to_csv(
+        os.path.join(export_dir, 'train.txt'), sep='\t', index=False, header=False)
+    valid_df.to_csv(
+        os.path.join(export_dir, 'valid.txt'), sep='\t', index=False, header=False)
+    test_df.to_csv(
+        os.path.join(export_dir, 'test.txt'), sep='\t', index=False, header=False)
+    
     # Copy config to export directory, for reproducibility
     shutil.copy2('config.py', export_dir)
 

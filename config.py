@@ -4,21 +4,32 @@ import scipy
 config = {
     # Path information
     # Export directory
-    'export_dir': 'data',
+    'export_dir': 'data_debug',
+
+    # Train-Valid-Test split
+    'split': (1., 0, 0),
 
     # Basic stats
     # Number of runs, each run will have a dedicated directory inside export_dir
-    'n_runs': 5,
+    'n_runs': 1,
     # Number of entities
-    'n_ents': 1_000,
+    'n_ents': 10,
     # Number of relations
-    'n_rels': 50,
+    'n_rels': 1,
     # Number of time windows
-    'n_tws': 100,
+    'n_tws': 3,
 
     # Patterns
+    # Distribution over entities, determining which are used to populate pattern templates.
+    # Should be a function taking a number of entities as input and returning the same number
+    # of weights. Defaults to uniform distribution
+    'pat_distr_ents': lambda x: scipy.stats.gamma.rvs(1, loc=0, scale=1, size=x),
+    # Distribution over relations, determining which are used to populate pattern templates
+    # Should be a function taking a number of relations as input and returning the same number
+    # of weights. Defaults to uniform distribution
+    'pat_distr_rels': lambda x: scipy.stats.gamma.rvs(1, loc=0, scale=1, size=x),
     # Number of 3-hop patterns
-    'n_3_hop': 100,
+    'n_3_hop': 10,
     # Time lag for 3-hop patterns
     'time_lag_3_hop': [
         (0, lambda: scipy.stats.poisson(5).rvs(1)[0]),
@@ -26,14 +37,14 @@ config = {
         (1, lambda: scipy.stats.poisson(5).rvs(1)[0]),
     ],
     # Number of 2-hop patterns
-    'n_2_hop': 100,
+    'n_2_hop': 10,
     # Time lag for 2-hop patterns
     'time_lag_2_hop': [
         (0, lambda: scipy.stats.poisson(5).rvs(1)[0]),
         (1, lambda: scipy.stats.poisson(5).rvs(1)[0]),
     ],
     # Number of 1-hop patterns
-    'n_1_hop': 100,
+    'n_1_hop': 10,
     # Time lag for 1-hop patterns
     'time_lag_1_hop': [
         (1, lambda: scipy.stats.poisson(5).rvs(1)[0]),
