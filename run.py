@@ -73,7 +73,7 @@ def add_new_pattern(
     """
     new_pat = False
     retry = 0
-    while (not new_pat) | (retry > config['max_retries']):
+    while (not new_pat) | (retry < config['max_retries']):
         pat = pattern_creation_func(entity2id, relation2id, time_lag)
         # Find out if quadruple is 
         quad = pat.__quadruples__()
@@ -184,7 +184,7 @@ def run(config: 'Dict[str,]', run_id: int):
                 'tail': tails.values,
                 't': [t]*dens,
                 'wt': [1]*dens,
-                'pattern': [[]]*dens,
+                'pattern': [[-1]]*dens,  # -1 indicates a randomly wired edge
             })
             edgelist = pd.concat([
                 edgelist,
@@ -219,7 +219,6 @@ def run(config: 'Dict[str,]', run_id: int):
                     't': ts_pat,
                     'wt': [1]*len(heads_pat),
                     'pattern': [[]]*len(heads_pat),
-                    # 'pattern': [[pattern_id]]*len(heads_pat),
                 })
                 edgelist = pd.concat([
                     edgelist,
@@ -259,9 +258,6 @@ def run(config: 'Dict[str,]', run_id: int):
                 rels.append(pattern.consequence[1])
                 tails.append(pattern.consequence[2])
                 pats.append([pattern_id])
-                # Note: Could try to label antecedent edges which satisfied this pattern with
-                # relevant pattern id. But I found this really difficult to track, since the
-                # way I track antecedent validity is like a branching tree.
         # Add all new consequences to edgelist
         df_pat = pd.DataFrame({
             'head': heads,
@@ -270,6 +266,10 @@ def run(config: 'Dict[str,]', run_id: int):
             't': [t]*len(heads),
             'wt': [1]*len(heads),
             'pattern': [[]]*len(heads),
+            # Labeling them now is okay, but because the artificial creation is
+            # forward-looking, some patterns may extend beyond our range of time
+            # windows, making them invalid in the span of time windows we care
+            # about. Instead, we label all edges for patterns later.
             # 'pattern': pats,
         })
         edgelist = pd.concat([
@@ -299,11 +299,6 @@ def run(config: 'Dict[str,]', run_id: int):
 
     # Deduplicate patterns
     edgelist.loc[:,'pattern'] = edgelist['pattern'].apply(lambda x: sorted(list(set(x))))
-    # # Aggregate duplicate edges again to deduplicate patterns
-    # edgelist = edgelist.groupby(['head', 'rel', 'tail', 't']).agg({
-    #     'wt': 'sum',
-    #     'pattern': lambda x: sorted(list(set([el for ids in x for el in ids]))),
-    # }).reset_index().sort_values(['t', 'head', 'tail', 'rel']).reset_index(drop=True)
     edgelist['head'] = edgelist['head'].astype(int)
     edgelist['rel'] = edgelist['rel'].astype(int)
     edgelist['tail'] = edgelist['tail'].astype(int)
