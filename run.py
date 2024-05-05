@@ -1,12 +1,14 @@
 import numpy as np
 import pandas as pd
+
+from joblib import Parallel, delayed
 from tqdm import tqdm
 
 import os
 import random
 import shutil
 
-from config import config
+from config import configs
 from patterns import create_1_hop_pattern, \
     create_2_hop_pattern, \
     create_3_hop_pattern
@@ -167,9 +169,14 @@ def run(config: 'Dict[str,]', run_id: int):
 
     # Apply patterns
     edgelist = create_edgelist()
-    for t in range(config['n_tws']):
+    pbar_tws = tqdm(range(config['n_tws']))
+    for t in pbar_tws:
+        pbar_tws.set_description(f'Time window: {t}')
         # First randomly wire entities
-        for ent_id in entity2id['id']:
+        pbar_ent = tqdm(entity2id['id'])
+        dfs_i = []
+        for ent_id in pbar_ent:
+            pbar_ent.set_description(f'Entity: {ent_id}')
             # Sample entities to use as tails
             if config['rnd_avg_density_distr']:
                 dens = config['rnd_avg_density_distr']()
@@ -186,13 +193,12 @@ def run(config: 'Dict[str,]', run_id: int):
                 'wt': [1]*dens,
                 'pattern': [[-1]]*dens,  # -1 indicates a randomly wired edge
             })
-            edgelist = pd.concat([
-                edgelist,
-                df_i,
-            ]).reset_index(drop=True)
-        
+            dfs_i.append(df_i)
+        edgelist = pd.concat([edgelist]+dfs_i)
+
         # Iterate over patterns
         heads, rels, tails, pats = [], [], [], []
+        dfs_pat = []
         for label, pattern_id in zip(pattern2id['pattern'], pattern2id['id']):
             # Instantiate pattern from label
             pattern = TemporalPattern()
@@ -220,10 +226,7 @@ def run(config: 'Dict[str,]', run_id: int):
                     'wt': [1]*len(heads_pat),
                     'pattern': [[]]*len(heads_pat),
                 })
-                edgelist = pd.concat([
-                    edgelist,
-                    df_pat,
-                ]).reset_index(drop=True)
+                dfs_pat.append(df_pat)
             
             # Apply valid patterns
             rnd = random.random()
@@ -258,8 +261,10 @@ def run(config: 'Dict[str,]', run_id: int):
                 rels.append(pattern.consequence[1])
                 tails.append(pattern.consequence[2])
                 pats.append([pattern_id])
+        # Add new forced patterns to edgelist
+        edgelist = pd.concat([edgelist]+dfs_pat)
         # Add all new consequences to edgelist
-        df_pat = pd.DataFrame({
+        df_con = pd.DataFrame({
             'head': heads,
             'rel': rels,
             'tail': tails,
@@ -274,8 +279,8 @@ def run(config: 'Dict[str,]', run_id: int):
         })
         edgelist = pd.concat([
             edgelist,
-            df_pat,
-        ]).reset_index(drop=True)
+            df_con,
+        ])
 
     # Cut off edgelist at n_tws (because forced patterns may have extended past n_tws)
     edgelist = edgelist[edgelist['t'] < config['n_tws']]
@@ -285,7 +290,7 @@ def run(config: 'Dict[str,]', run_id: int):
         'pattern': lambda x: sorted(list(set([el for ids in x for el in ids]))),
     }).reset_index().sort_values(['t', 'head', 'tail', 'rel']).reset_index(drop=True)
     
-    # Post-creation label all valid patterns
+    # Post-creation, label all valid patterns
     for label, pattern_id in zip(pattern2id['pattern'], pattern2id['id']):
         # Instantiate pattern from label
         pattern = TemporalPattern()
@@ -333,11 +338,19 @@ def run(config: 'Dict[str,]', run_id: int):
     train_df = edgelist[edgelist['t'] <= end_train]
     valid_df = edgelist[(edgelist['t'] > end_train) & (edgelist['t'] <= end_valid)]
     test_df = edgelist[edgelist['t'] > end_valid]
-    train_df.to_csv(
+    cols_export = [
+        'head', 
+        'rel',
+        'tail',
+        't',
+        'wt',
+        'pattern',
+    ]
+    train_df[cols_export].to_csv(
         os.path.join(export_dir, 'train.txt'), sep='\t', index=False, header=False)
-    valid_df.to_csv(
+    valid_df[cols_export].to_csv(
         os.path.join(export_dir, 'valid.txt'), sep='\t', index=False, header=False)
-    test_df.to_csv(
+    test_df[cols_export].to_csv(
         os.path.join(export_dir, 'test.txt'), sep='\t', index=False, header=False)
     
     # Copy config to export directory, for reproducibility
@@ -345,6 +358,13 @@ def run(config: 'Dict[str,]', run_id: int):
 
 
 if __name__ == "__main__":
-    n_runs = config['n_runs']
-    for run_id in tqdm(range(n_runs)):
-        run(config, run_id)
+    # Iterate over configuration files
+    # Note: This could also be parallelized or otherwise done in a better way
+    for config in configs:
+        n_runs = config['n_runs']
+        n_jobs = config['n_jobs']
+        n_jobs = min(n_jobs, n_runs)  # Can't have more jobs than runs
+
+        Parallel(n_jobs=n_jobs)(
+            delayed(run)(config, run_id) for run_id in range(n_runs)
+        )
