@@ -173,6 +173,9 @@ def create_3_hop_pattern(
     sampled_relations = relation2id.sample(
         4, weights='wt', replace=True, random_state=seed)['id'].tolist()
     
+    # Note: This check on the third antecedent can be moved after the check on the
+    # intersection of the first and second antecedents, since that one also modified
+    # the third antecedent.
     # Third antecedent must intersect at least one prior antecedent
     if ~entities_intersect(sampled_entities[:4], sampled_entities[4:6]):
         # Enforce that the third antecedent include entities from at least one prior

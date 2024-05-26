@@ -181,7 +181,21 @@ def run(config: 'Dict[str,]', run_id: int):
             if config['rnd_avg_density_distr']:
                 dens = config['rnd_avg_density_distr']()
             else:
-                dens = int(config['rnd_avg_density'])
+                dens = config['rnd_avg_density']
+            # Handle random density specifications in the range (0,1)
+            if (dens > 0) and (dens < 1):
+                rnd = random.random()
+                # With specified probability, sample one random edge
+                if rnd < dens:
+                    dens = 1
+                # Otherwise, no random edge is sampled
+                else:
+                    dens = 0
+            else:
+                dens = int(dens)
+            if dens == 0:
+                # No random edge
+                continue
             tails = entity2id['id'].sample(dens, replace=True)
             # Sample relations to connect them
             rels = relation2id['id'].sample(dens, replace=True)
