@@ -76,10 +76,18 @@ class TemporalPattern():
         ]
         # Format antecedent and consequence
         antecedent = [
-            eval('('+','.join(ant.strip(' ()').split(',')[:3])+')')
+            tuple([
+                el.strip() if not el.strip().isnumeric()
+                else int(el.strip())
+                for el in ant.strip(' ()').split(',')[:3]
+            ])
             for ant in antecedent
         ]
-        consequence = eval('('+','.join(consequence.strip(' ()').split(',')[:3])+')')
+        consequence = tuple([
+            el.strip() if not el.strip().isnumeric()
+            else int(el.strip())
+            for el in consequence.strip(' ()').split(',')[:3]
+        ])
         
         self.antecedent = antecedent
         self.consequence = consequence

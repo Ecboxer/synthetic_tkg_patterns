@@ -2,18 +2,34 @@ from itertools import combinations, product
 
 import random
 
+import numpy as np
 
-def is_subpattern(subpattern: 'List[Tuple]', patterns: 'List[Tuple]') -> bool:
+
+def is_subpattern(
+    subpattern: 'List[Tuple]', patterns: 'List[Tuple]', ignore_timing: bool = True
+) -> bool:
     """ Test whether subpattern is a subpattern of any member of patterns
+
+    Args:
+        ignore_timing (bool): Whether to ignore timing differences (and only consider
+            edge triple information) when detecting subpatterns. Default True.
     """
     n = len(subpattern)
+
+    def _strip_timing(seq):
+        # Helper to strip timing information from edge quadruples
+        return [t[:3] for t in seq] if ignore_timing else list(seq)
+    
+    # Convert query to tuple (optionally, strip timing)
+    query = tuple(_strip_timing(subpattern))
+
+    # Construct consecutive subsets of patterns (optionally, strip timing)
     pattern_subsets = set([
-        tuple(pattern[idx:idx+n]) for pattern in patterns
+        tuple(_strip_timing(pattern[idx:idx+n])) for pattern in patterns
         for idx in range(len(pattern)-n+1)
     ])
-    if tuple(subpattern) in pattern_subsets:
-        return True
-    return False
+
+    return query in pattern_subsets
 
 def entities_intersect(entities1: 'List[int]', entities2: 'List[int]') -> bool:
     """ Indicate whether entities1 and entities2 have any intersection
@@ -104,6 +120,7 @@ def force_connect_components(
 def create_time_lag_tuples(
     time_lags: 'List[Tuple(float,float)]',
     antecedent: 'List[Tuple[int,int,int]]',
+    seed: int = None,
 ) -> 'List[Tuple[float,float]]':
     """ Create time_lag_tuples used to instantiate patterns. Contains logic to prohibit: identical
     antecedents from having 0 time lag between them, the consequence from having 0 lag from the
@@ -113,14 +130,14 @@ def create_time_lag_tuples(
     for idx, time_lag in enumerate(time_lags):
         lag_min, lag_max = time_lag[0], time_lag[1]
         time_lag_tuple = []
-        if type(lag_min) in [float, int]:
+        if type(lag_min) in [float, int, np.int64]:
             pass
         else:
-            lag_min = lag_min()
-        if type(lag_max) in [float, int]:
+            lag_min = lag_min(seed)
+        if type(lag_max) in [float, int, np.int64]:
             pass
         else:
-            lag_max = lag_max()
+            lag_max = lag_max(seed)
         # Prohibit identical antecedents from having 0 lag_min between them
         if (idx < len(antecedent)-1) and (antecedent[idx] == antecedent[idx+1]):
             lag_min = max(1, lag_min)
@@ -128,5 +145,28 @@ def create_time_lag_tuples(
         if idx == len(antecedent)-1:
             lag_min = max(1, lag_min)
         # Enforce that lag_max is no smaller than lag_min
-        time_lag_tuples.append((lag_min, max(lag_min, lag_max)))
+        time_lag_tuples.append((int(lag_min), int(max(lag_min, lag_max))))
     return time_lag_tuples
+
+def canonicalize_entities_and_relations(*triples):
+    # Helper to relabel entities and relations according to an ascending index
+    all_entities = [e for t in triples for e in (t[0], t[2])]
+    all_relations = [t[1] for t in triples]
+
+    unique_entities = []
+    for e in all_entities:
+        if e not in unique_entities:
+            unique_entities.append(e)
+    entity_map = {e: f"e{idx+1}" for idx, e in enumerate(unique_entities)}
+
+    unique_relations = []
+    for r in all_relations:
+        if r not in unique_relations:
+            unique_relations.append(r)
+    relation_map = {r: f"r{idx+1}" for idx, r in enumerate(unique_relations)}
+
+    # Relabel entities and relations according to minimal indices
+    return tuple(
+        (entity_map[t[0]], relation_map[t[1]], entity_map[t[2]])
+        for t in triples
+    )
