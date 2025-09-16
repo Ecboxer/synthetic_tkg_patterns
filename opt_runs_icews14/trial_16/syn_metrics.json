@@ -1,0 +1,10 @@
+{
+  "n_ents": 0,
+  "n_rels": 0,
+  "n_tws": 0,
+  "n_quads": 0,
+  "n_unique_triples": 0,
+  "avg_degree": 0.0,
+  "deg_p25": 0.0,
+  "deg_p75": 0.0
+}

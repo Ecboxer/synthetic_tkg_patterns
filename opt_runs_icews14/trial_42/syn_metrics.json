@@ -1,0 +1,10 @@
+{
+  "n_ents": 6472,
+  "n_rels": 214,
+  "n_tws": 365,
+  "n_quads": 35966,
+  "n_unique_triples": 35939,
+  "avg_degree": 11.11433868974042,
+  "deg_p25": 5.0,
+  "deg_p75": 15.0
+}

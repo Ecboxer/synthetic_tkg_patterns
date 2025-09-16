@@ -1,0 +1,21 @@
+{
+  "seed_base": 0,
+  "n_ents": 7128,
+  "n_rels": 230,
+  "n_tws": 365,
+  "_pat_distr_ents_choice": "gamma(0.5,1.0)",
+  "_pat_distr_rels_choice": "uniform",
+  "n_1_hop": 152,
+  "n_2_hop": 194,
+  "n_3_hop": 44,
+  "require_unique_triples": false,
+  "prohibit_selfconnections": true,
+  "prohibit_new_consequence_relations": false,
+  "require_sequential_rule": true,
+  "use_density_dist": false,
+  "rnd_avg_density": 0,
+  "p_skip_consequence": 0.0,
+  "use_force_distr": false,
+  "p_force": 0.1,
+  "n_force": 0
+}

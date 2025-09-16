@@ -1,0 +1,1 @@
+RuntimeError: No edges were generated. With rnd_avg_density=0 and zero forcing/patterns, the graph is empty. Increase n_force/p_force and/or pattern counts.
