@@ -409,12 +409,12 @@ def _write_trial_artifacts(
         **({f"real_{k}": real_metrics[k] for k in _METRIC_KEYS} if real_metrics else {}),
         # Errors
         **errors,
-        # Params (unchanged)
+        # Params
         "pat_distr_ents": safe_params.get("_pat_distr_ents_choice"),
         "pat_distr_rels": safe_params.get("_pat_distr_rels_choice"),
-        "n_ents": safe_params.get("n_ents"),
-        "n_rels": safe_params.get("n_rels"),
-        "n_tws": safe_params.get("n_tws"),
+        "cfg_n_ents": safe_params.get("n_ents"),
+        "cfg_n_rels": safe_params.get("n_rels"),
+        "cfg_n_tws": safe_params.get("n_tws"),
         "n_1_hop": safe_params.get("n_1_hop"),
         "n_2_hop": safe_params.get("n_2_hop"),
         "n_3_hop": safe_params.get("n_3_hop"),
@@ -549,9 +549,9 @@ def objective_factory(
         params['_pat_distr_rels_choice'] = r_choice
 
         # Pattern counts
-        params['n_1_hop'] = trial.suggest_int("n_1_hop", 1, 200)
-        params['n_2_hop'] = trial.suggest_int("n_2_hop", 0, 200)
-        params['n_3_hop'] = trial.suggest_int("n_3_hop", 0, 200)
+        params['n_1_hop'] = trial.suggest_int("n_1_hop", 15, 400)
+        params['n_2_hop'] = trial.suggest_int("n_2_hop", 10, 300)
+        params['n_3_hop'] = trial.suggest_int("n_3_hop", 5, 200)
 
         # Booleans pattern hyperparameters
         params['require_unique_triples'] = trial.suggest_categorical(
@@ -576,7 +576,7 @@ def objective_factory(
 
         # Forcing mechanism (effectively a binomial distribution)
         params['use_force_distr'] = False
-        params['p_force'] = trial.suggest_float("p_force", 0.0, 1.0, step=0.05)
+        params['p_force'] = trial.suggest_float("p_force", 0.05, 1.0, step=0.05)
         params['n_force'] = trial.suggest_int("n_force", 1, 5)
 
         # Build config for this trial
