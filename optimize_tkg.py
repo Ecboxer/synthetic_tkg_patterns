@@ -39,6 +39,13 @@ _METRIC_KEYS = [
 # Handle empty edgelist-producing hyperparameter settings
 PENALTY_SCORE = 1e9
 
+GAMMA_OPTIONS = {
+    "gamma(1,2)": (1.0, 2.0),
+    "gamma(2,2)": (2.0, 2.0),
+    "gamma(3,1)": (3.0, 1.0),
+    "gamma(0.5,1.0)": (0.5, 1.0),
+}
+
 def _empty_metrics():
     return {
         "n_ents": 0, "n_rels": 0, "n_tws": 0, "n_quads": 0,
@@ -291,6 +298,28 @@ def make_gamma_weight_sampler(shape: float, scale: float):
     return sampler
 
 
+def build_choice_to_sampler(ref_tkg_dir: str):
+    """
+    Returns a function choice_to_sampler(choice, which) that maps a string choice
+    ('uniform' | 'empirical' | one of GAMMA_OPTIONS) to a callable sampler or None.
+    """
+    ref_df = load_tkg_dir(ref_tkg_dir)
+    emp_ent = make_empirical_weight_sampler(_empirical_probs_entities(ref_df))
+    emp_rel = make_empirical_weight_sampler(_empirical_probs_relations(ref_df))
+
+    def choice_to_sampler(choice: str, which: str):
+        if choice == "uniform":
+            return None
+        if choice == "empirical":
+            return emp_ent if which == "ents" else emp_rel
+        if choice in GAMMA_OPTIONS:
+            sh, sc = GAMMA_OPTIONS[choice]
+            return make_gamma_weight_sampler(sh, sc)
+        raise ValueError(f"Unknown distribution choice: {choice}")
+
+    return choice_to_sampler
+
+
 # Distribution + error helpers
 def compute_distributions(df: pd.DataFrame) -> dict:
     """
@@ -461,6 +490,130 @@ def materialize_best_trial(export_root: str, best_trial_id: int) -> str:
     return dst
 
 
+# Recency and frequency baseline helpers
+def _mk_query_index(df_all: pd.DataFrame):
+    """
+    Build hist[(h,r)] = list of (t, tail) sorted by t ascending
+    """
+    df_all = df_all.sort_values(["t"]).reset_index(drop=True)
+    hist = {}
+    for h, r, t, tail in df_all[["head","rel","t","tail"]].itertuples(index=False, name=None):
+        hist.setdefault((h, r), []).append((int(t), int(tail)))
+    return hist
+
+def _iter_test_queries(test_df: pd.DataFrame, max_q: int):
+    # per-row queries (h, r, t, true_tail)
+    if max_q is not None and max_q < len(test_df):
+        test_df = test_df.sample(max_q, random_state=0)
+    for h, r, t, tail in test_df[["head","rel","t","tail"]].itertuples(index=False, name=None):
+        yield int(h), int(r), int(t), int(tail)
+
+def _hits_at_k_from_ranklist(true_tail: int, rank_list: list[int], Ks: list[int]) -> dict:
+    pos = {tail: i for i, tail in enumerate(rank_list)}
+    out = {}
+    for k in Ks:
+        out[f"@{k}"] = 1.0 if (true_tail in pos and pos[true_tail] < k) else 0.0
+    return out
+
+def _recency_ranklist(hist_list: list[tuple[int,int]], t: int) -> list[int]:
+    """Return unique tails ranked by most recent occurrence before t."""
+    # walk backwards and collect first-seen tails
+    seen = set()
+    ranked = []
+    for t_i, tail in reversed(hist_list):
+        if t_i >= t:
+            continue
+        if tail not in seen:
+            seen.add(tail)
+            ranked.append(tail)
+    return ranked  # already most-recent-first
+
+def _frequency_ranklist(hist_list: list[tuple[int,int]], t: int, history_len: int) -> list[int]:
+    """Look back to last `history_len` occurrences before t; rank by frequency desc, tiebreak by recency."""
+    window = []
+    for t_i, tail in reversed(hist_list):
+        if t_i >= t:
+            continue
+        window.append((t_i, tail))
+        if len(window) >= history_len:
+            break
+    if not window:
+        return []
+    # counts + most recent tiebreaker
+    freq = {}
+    last_t = {}
+    for t_i, tail in window:
+        freq[tail] = freq.get(tail, 0) + 1
+        last_t[tail] = max(last_t.get(tail, -10**18), t_i)
+    # sort by (-count, -last_t)
+    ranked = sorted(freq.keys(), key=lambda x: (-freq[x], -last_t[x]))
+    return ranked
+
+def evaluate_baselines(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    *,
+    recency_k_list: list[int],
+    frequency_k_list: list[int],
+    history_len_list: list[int],
+    max_queries: int = None
+) -> dict:
+    """
+    Returns a flat dict, e.g.:
+      {
+        "recency@1": 0.24, "recency@3": ...,
+        "frequency(h=5)@1": ..., "frequency(h=50)@10": ...
+      }
+    """
+    # pool history from *all* prior edges (train+valid+test with t'<t); typical is train+valid, but this is robust
+    df_all = pd.concat([train_df, valid_df, test_df], ignore_index=True)
+    hist = _mk_query_index(df_all)
+
+    # iterate queries
+    n = 0
+    acc_rec = {k: 0.0 for k in recency_k_list}
+    acc_freq = {(h, k): 0.0 for h in history_len_list for k in frequency_k_list}
+
+    for h, r, t, true_tail in _iter_test_queries(test_df, max_queries):
+        lst = hist.get((h, r))
+        if not lst:
+            continue
+        # RECAP: evaluate per-row truth (tail at exactly (h,r,t))
+        n += 1
+
+        if recency_k_list:
+            rlist = _recency_ranklist(lst, t)
+            for k in recency_k_list:
+                acc_rec[k] += _hits_at_k_from_ranklist(true_tail, rlist, [k])[f"@{k}"]
+
+        for H in history_len_list or []:
+            rlist = _frequency_ranklist(lst, t, history_len=H)
+            for k in frequency_k_list:
+                acc_freq[(H, k)] += _hits_at_k_from_ranklist(true_tail, rlist, [k])[f"@{k}"]
+
+    # finalize
+    out = {}
+    denom = max(n, 1)
+    for k in recency_k_list:
+        out[f"recency@{k}"] = acc_rec[k] / denom
+    for H in history_len_list or []:
+        for k in frequency_k_list:
+            out[f"frequency(h={H})@{k}"] = acc_freq[(H, k)] / denom
+    return out
+
+def score_baseline_similarity(syn_b: dict, ref_b: dict) -> float:
+    """
+    Average absolute difference across common baseline keys.
+    (All Hits@K are in [0,1], so denom=1.)
+    """
+    keys = sorted(set(syn_b.keys()) & set(ref_b.keys()))
+    if not keys:
+        return 0.0
+    diffs = [abs(float(syn_b[k]) - float(ref_b[k])) for k in keys]
+    return float(np.mean(diffs))
+
+
 # Objective wrapper
 def prepare_target_metrics(ref_tkg_dir: str) -> dict:
     target_df = load_tkg_dir(ref_tkg_dir)
@@ -481,16 +634,26 @@ def extract_synthetic_metrics_from_dir(run_dir: str) -> dict:
 
 
 def objective_factory(
-    base_config: dict, ref_tkg_dir: str, export_dir: str, metric_weights: dict,
+    base_config: dict, 
+    ref_tkg_dir: str,
+    export_dir: str,
+    metric_weights: dict,
+    *,
+    recency_k_list: list[int],
+    frequency_k_list: list[int],
+    history_len_list: list[int],
+    baseline_weight: float,
+    baseline_max_queries_ref: int,
+    baseline_max_queries_syn: int,
 ):
     target = prepare_target_metrics(ref_tkg_dir)
 
     # Precompute empirical samplers
     ref_tkg_df = load_tkg_dir(ref_tkg_dir)
-    _emp_ent_probs = _empirical_probs_entities(ref_tkg_df)
-    _emp_rel_probs = _empirical_probs_relations(ref_tkg_df)
-    _emp_ent_sampler = make_empirical_weight_sampler(_emp_ent_probs)
-    _emp_rel_sampler = make_empirical_weight_sampler(_emp_rel_probs)
+    # _emp_ent_probs = _empirical_probs_entities(ref_tkg_df)
+    # _emp_rel_probs = _empirical_probs_relations(ref_tkg_df)
+    # _emp_ent_sampler = make_empirical_weight_sampler(_emp_ent_probs)
+    # _emp_rel_sampler = make_empirical_weight_sampler(_emp_rel_probs)
 
     # Compute target distributions and sizes at the study root
     target_distributions = compute_distributions(ref_tkg_df)
@@ -510,24 +673,29 @@ def objective_factory(
         with open(root_target_dists, "w") as f:
             json.dump(target_distributions, f, indent=2)
 
-    # Define choices & mapping for pat_distr_*
-    gamma_options = {
-        "gamma(1,2)": (1.0, 2.0),
-        "gamma(2,2)": (2.0, 2.0),
-        "gamma(3,1)": (3.0, 1.0),
-        "gamma(0.5,1.0)": (0.5, 1.0),
-    }
-    distr_choices = ["uniform", "empirical"] + list(gamma_options.keys())
+    # Reference TKG baseline performance
+    ref_train = _read_edgelist_any(os.path.join(ref_tkg_dir, "train.txt"))
+    ref_valid = _read_edgelist_any(os.path.join(ref_tkg_dir, "valid.txt"))
+    ref_test  = _read_edgelist_any(os.path.join(ref_tkg_dir, "test.txt"))
 
-    def _choice_to_sampler(choice: str, which: str):
-        if choice == "uniform":
-            return None
-        if choice == "empirical":
-            return _emp_ent_sampler if which == "ents" else _emp_rel_sampler
-        if choice in gamma_options:
-            sh, sc = gamma_options[choice]
-            return make_gamma_weight_sampler(sh, sc)
-        raise ValueError(f"Unknown distribution choice: {choice}")
+    ref_baseline_path = os.path.join(export_dir, "target_baselines.json")
+    if os.path.exists(ref_baseline_path):
+        with open(ref_baseline_path, "r") as f:
+            target_baselines = json.load(f)
+    else:
+        target_baselines = evaluate_baselines(
+            train_df=ref_train, valid_df=ref_valid, test_df=ref_test,
+            recency_k_list=recency_k_list,
+            frequency_k_list=frequency_k_list,
+            history_len_list=history_len_list,
+            max_queries=baseline_max_queries_ref,
+        )
+        with open(ref_baseline_path, "w") as f:
+            json.dump(target_baselines, f, indent=2)
+    
+    # Define choices & mapping for pat_distr_*
+    choice_to_sampler = build_choice_to_sampler(ref_tkg_dir)
+    distr_choices = ["uniform", "empirical"] + list(GAMMA_OPTIONS.keys())
 
     def objective_optuna(trial):
         # Suggest params
@@ -542,8 +710,10 @@ def objective_factory(
         # Choose pat_distr_* options
         e_choice = trial.suggest_categorical("pat_distr_ents", distr_choices)
         r_choice = trial.suggest_categorical("pat_distr_rels", distr_choices)
-        params['_pat_distr_ents_fn'] = _choice_to_sampler(e_choice, "ents")
-        params['_pat_distr_rels_fn'] = _choice_to_sampler(r_choice, "rels")
+        # params['_pat_distr_ents_fn'] = _choice_to_sampler(e_choice, "ents")
+        # params['_pat_distr_rels_fn'] = _choice_to_sampler(r_choice, "rels")
+        params['_pat_distr_ents_fn'] = choice_to_sampler(e_choice, "ents")
+        params['_pat_distr_rels_fn'] = choice_to_sampler(r_choice, "rels")
         # Keep human-readable choices for logging
         params['_pat_distr_ents_choice'] = e_choice
         params['_pat_distr_rels_choice'] = r_choice
@@ -554,9 +724,7 @@ def objective_factory(
         params['n_3_hop'] = trial.suggest_int("n_3_hop", 5, 200)
 
         # Booleans pattern hyperparameters
-        params['require_unique_triples'] = trial.suggest_categorical(
-            "require_unique_triples", [False, True]
-        )
+        params['require_unique_triples'] = True  # EB: Fix to True
         params['prohibit_selfconnections'] = trial.suggest_categorical(
             "prohibit_selfconnections", [False, True]
         )
@@ -589,7 +757,30 @@ def objective_factory(
             syn_metrics = extract_synthetic_metrics_from_dir(cfg['export_dir'])
 
             syn_distributions = extract_synthetic_distributions_from_dir(cfg['export_dir'])
-            score = score_metrics(syn_metrics, target, metric_weights)
+
+            # Synthetic baselines, optionally subsampled
+            run0 = os.path.join(cfg["export_dir"], "run_0")
+            if not os.path.isdir(run0):
+                run0 = cfg["export_dir"]
+            syn_train = _read_edgelist_any(os.path.join(run0, "train.txt"))
+            syn_valid = _read_edgelist_any(os.path.join(run0, "valid.txt"))
+            syn_test = _read_edgelist_any(os.path.join(run0, "test.txt"))
+
+            syn_baselines = evaluate_baselines(
+                train_df=syn_train, valid_df=syn_valid, test_df=syn_test,
+                recency_k_list=recency_k_list,
+                frequency_k_list=frequency_k_list,
+                history_len_list=history_len_list,
+                max_queries=baseline_max_queries_syn,
+            )
+
+            score_core = score_metrics(syn_metrics, target, metric_weights)
+            score_base = score_baseline_similarity(syn_baselines, target_baselines) if baseline_weight > 0 else 0.0
+            score = float(score_core + baseline_weight * score_base)
+
+            # Attach baseline results
+            trial.set_user_attr("syn_baselines", syn_baselines)
+            trial.set_user_attr("ref_baselines", target_baselines)
         except Exception as e:
             # Penalize this region of the space but keep the study running
             syn_metrics = _empty_metrics()
@@ -621,9 +812,16 @@ def objective_factory(
             syn_distributions=syn_distributions,
             real_distributions=target_distributions,
         )
-        print(f"[trial {trial.number:03d}] score={score:.4f} | E/R dists={params.get('_pat_distr_ents_choice')}/{params.get('_pat_distr_rels_choice')} | "
-              f"n_hops=({params['n_1_hop']},{params['n_2_hop']},{params['n_3_hop']}) | n_ents={params['n_ents']} n_rels={params['n_rels']} n_tws={params['n_tws']}",
-              flush=True)
+        with open(os.path.join(cfg['export_dir'], "syn_baselines.json"), "w") as f:
+            json.dump(syn_baselines, f, indent=2)
+        print(
+            f"[trial {trial.number:03d}] "
+            f"score={score:.4f} (core={score_core:.4f}, base*w={baseline_weight*score_base:.4f}) | "
+            f"E/R dists={params.get('_pat_distr_ents_choice')}/{params.get('_pat_distr_rels_choice')} | "
+            f"n_hops=({params['n_1_hop']},{params['n_2_hop']},{params['n_3_hop']}) | "
+            f"n_ents={params['n_ents']} n_rels={params['n_rels']} n_tws={params['n_tws']}",
+            flush=True
+        )
 
         # Dashboard logging
         trial.set_user_attr("syn_metrics", syn_metrics)
@@ -652,7 +850,40 @@ def main():
                     help="Optional path to a JSON file with base config overrides (merged into your default).")
     ap.add_argument("--weights", default=None,
                     help="JSON dict of metric weights, e.g. '{\"n_ents\":2,\"avg_degree\":3}'")
+    ap.add_argument("--skip_labeling",
+                    action="store_true",
+                    help="Skip the post-generation labeling step inside run() to speed up trials.")
+    # Additional criteria: Similarity of the recency and frequency baselines on synthetic and reference TKG
+    ap.add_argument("--recency_k", default="",
+                    help="Comma-separated Ks for recency Hits@K, e.g. '1,3,10'. Blank disables.")
+    ap.add_argument("--frequency_k", default="",
+                    help="Comma-separated Ks for frequency Hits@K, e.g. '1,3,10'. Blank disables.")
+    ap.add_argument("--history_len", default="",
+                    help="Comma-separated history lengths for frequency baseline, e.g. '5,20'. Blank disables.")
+    ap.add_argument("--baseline_weight", type=float, default=1.0,
+                    help="Weight for baseline-similarity error term in the objective. 0 disables.")
+    ap.add_argument("--baseline_max_queries_ref", type=int, default=None,
+                    help="Optional cap on # of test queries used for reference baseline eval. None means all queries are run.")
+    ap.add_argument("--baseline_max_queries_syn", type=int, default=5_000,
+                    help="Optional cap on # of test queries used for synthetic baseline eval to speed up trials.")
+    # Parallelization
+    # Note: Not well implemented, just slows things down
+    ap.add_argument("--n_jobs", type=int, default=1,
+                    help="Number of parallel trials to run in this process (threads).")
+    ap.add_argument("--storage", default="",
+                    help="(Optional) Optuna storage URL for multi-process parallelism (e.g. 'sqlite:///path/to/optuna.db').")
+    ap.add_argument("--study_name", default="tkg_opt",
+                    help="Study name (used only if --storage is provided).")
+    
     args = ap.parse_args()
+
+    def _parse_int_list(s):
+        s = (s or "").strip()
+        return [int(x) for x in s.split(",") if x.strip().isdigit()]
+
+    recency_k_list = _parse_int_list(args.recency_k)
+    frequency_k_list = _parse_int_list(args.frequency_k)
+    history_len_list = _parse_int_list(args.history_len)
 
     os.makedirs(args.export_root, exist_ok=True)
 
@@ -661,6 +892,7 @@ def main():
         'export_dir': args.export_root,
         'seed': 0,
         'debug': False,
+        'skip_labeling': False,
         'split': (.8, .1, .1),
         'fast_force_consequence': True,
         'n_runs': 1,
@@ -706,6 +938,10 @@ def main():
         with open(args.base_config, "r") as fh:
             override = json.load(fh)
         base_config.update(override)
+    
+    # Apply CLI skip to all trials
+    if args.skip_labeling:
+        base_config['skip_labeling'] = True
 
     # Metric weights
     metric_weights = None
@@ -717,10 +953,42 @@ def main():
         ref_tkg_dir=args.ref_tkg_dir,
         export_dir=args.export_root,
         metric_weights=metric_weights or None,
+        recency_k_list=recency_k_list,
+        frequency_k_list=frequency_k_list,
+        history_len_list=history_len_list,
+        baseline_weight=float(args.baseline_weight),
+        baseline_max_queries_ref=args.baseline_max_queries_ref,
+        baseline_max_queries_syn=args.baseline_max_queries_syn,
     )
 
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective_optuna, n_trials=args.budget, show_progress_bar=True)
+    # Create sampler
+    sampler = optuna.samplers.TPESampler(
+        seed=0,
+        n_startup_trials=20,  # Purely random at the beginning
+        multivariate=True,
+        group=True,
+    )
+
+    # Create study (in-memory or backed by storage for multi-process)
+    if args.storage:
+        # Centralized storage for coordination across multiple processes
+        study = optuna.create_study(
+            direction="minimize",
+            storage=args.storage,
+            study_name=args.study_name,
+            load_if_exists=True,
+            sampler=sampler,
+        )
+    else:
+        # No storage, single-process study
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+    
+    study.optimize(
+        objective_optuna,
+        n_trials=args.budget,
+        show_progress_bar=True,
+        n_jobs=max(1, args.n_jobs),
+    )
 
     print("\n=== Best trial ===")
     print("Number:", study.best_trial.number)
@@ -734,6 +1002,38 @@ def main():
         print(f"\nBest trial copied to: {best_dir}")
     except Exception as e:
         print(f"\n[WARN] Failed to copy best trial: {e}", file=sys.stderr)
+    
+    # If we skipped labeling, rerun the best trial with labeling on
+    if args.skip_labeling:
+        try:
+            print("\n[post] Re-running best trial with labeling enabled...")
+
+            # Map the saved choices back to samplers (same logic as during trials)
+            choice_to_sampler = build_choice_to_sampler(args.ref_tkg_dir)
+
+            best_params = dict(study.best_trial.params)
+            best_params["_pat_distr_ents_fn"] = choice_to_sampler(best_params["pat_distr_ents"], "ents")
+            best_params["_pat_distr_rels_fn"] = choice_to_sampler(best_params["pat_distr_rels"], "rels")
+            best_params["_pat_distr_ents_choice"] = best_params["pat_distr_ents"]
+            best_params["_pat_distr_rels_choice"] = best_params["pat_distr_rels"]
+
+            # Build the *same* config the trial used (same seed scheme). 
+            labeled_cfg = make_config_from_trial(
+                base_config=base_config,
+                trial_params=best_params,
+                export_dir=args.export_root,
+                trial_id=study.best_trial.number,
+            )
+
+            # Only edit labeling and export dir
+            labeled_cfg["skip_labeling"] = False
+            labeled_cfg["export_dir"] = os.path.join(args.export_root, "best_trial_labeled")
+            os.makedirs(labeled_cfg["export_dir"], exist_ok=True)
+
+            generate_one(labeled_cfg, run_id=0)
+            print(f"[post] Labeled best trial written to: {labeled_cfg['export_dir']}")
+        except Exception as e:
+            print(f"[post][WARN] Failed to produce labeled best trial: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -741,25 +1041,49 @@ if __name__ == "__main__":
 
 """
 Run commands:
+# ckg09 Trial 59
 python3 optimize_tkg.py \
     --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
-    --budget 100 \
-    --export_root opt_runs_icews14_20250916
+    --budget 200 \
+    --recency_k '1,3,10' \
+    --frequency_k '1,3,10' \
+    --history_len '3,10' \
+    --baseline_weight 1.0 \
+    --export_root opt_runs_icews14_20250930
 
+# ckg05
+python3 optimize_tkg.py \
+    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
+    --budget 400 \
+    --recency_k '1,3,10' \
+    --frequency_k '1,3,10' \
+    --history_len '3,10' \
+    --baseline_weight 10.0 \
+    --export_root opt_runs_icews14_20251001 \
+
+# DONE
 python3 optimize_tkg.py \
     --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS18 \
-    --budget 100 \
-    --export_root opt_runs_icews18_20250916
+    --budget 200 \
+    --recency_k '1,3,10' \
+    --frequency_k '1,3,10' \
+    --history_len '3,10' \
+    --baseline_weight 1.0 \
+    --export_root opt_runs_icews18_20250926
 
-python3 optimize_tkg.py \
-    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/YAGO \
-    --budget 100 \
-    --export_root opt_runs_yago_20250916
-
+# Interrupted early
 python3 optimize_tkg.py \
     --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/WIKI \
     --budget 100 \
     --export_root opt_runs_wiki_20250916
+    --skip_labeling
+
+# Interrupted early
+python3 optimize_tkg.py \
+    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/YAGO \
+    --budget 100 \
+    --export_root opt_runs_yago_20250916
+    --skip_labeling
 
 Use --weights to emphasize certain metrics, e.g.:
 --weights '{"n_ents":2,"n_rels":2,"n_quads":3,"avg_degree":3,"deg_p25":1,"deg_p75":1,"n_tws":1,"n_unique_triples":1}'

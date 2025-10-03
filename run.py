@@ -8,11 +8,15 @@ from joblib import Parallel, delayed
 from pathlib import Path
 from tqdm import tqdm
 
-import argparse, importlib.util, sys, uuid
+import argparse
+import importlib.util
+import inspect
+import json
 import os
 import random
 import re
-import shutil
+import sys
+import uuid
 
 from patterns import instantiate_patterns_from_df
 from pattern_library import load_or_generate_patterns
@@ -77,6 +81,37 @@ def _make_empirical_weight_sampler(probs: np.ndarray):
         return w
     return sampler
 
+def _jsonify(obj):
+    """Make any object JSON-serializable (best-effort)."""
+    # Numpy scalars
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
+        return obj.item()
+    # Basic containers
+    if isinstance(obj, dict):
+        return {k: _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    # Callables -> readable description
+    if callable(obj):
+        name = getattr(obj, "__name__", "<lambda>")
+        try:
+            src = inspect.getsource(obj).strip()
+        except Exception:
+            src = repr(obj)
+        return {"__callable__": name, "repr": src}
+    # Anything else: try JSON, fallback to str
+    try:
+        json.dumps(obj)
+        return obj
+    except TypeError:
+        return str(obj)
+
+def dump_config_snapshot(export_dir: str, config: dict):
+    """Write the effective config to disk in a robust, JSON-safe way."""
+    snap_path = os.path.join(export_dir, "config_used.json")
+    with open(snap_path, "w") as f:
+        json.dump(_jsonify(config), f, indent=2)
+
 # Cache so we only read each TKG directory once
 _EMP_CACHE = {}  # path -> {"ents": sampler, "rels": sampler}
 
@@ -119,16 +154,7 @@ def _resolve_pat_sampler(config_value, fallback_path_key: str, kind: str, config
 
 
 # Helpers to create entity, relation, and time window indices
-# def create_entity2id(config, seed) -> pd.DataFrame:
-#     if config['pat_distr_ents']:
-#         wts = config['pat_distr_ents'](config['n_ents'], seed)
-#     else:
-#         wts = [1]*config['n_ents']
-#     return pd.DataFrame({
-#         'name': range(config['n_ents']),
-#         'id': range(config['n_ents']),
-#         'wt': wts,
-#     })
+
 def create_entity2id(config, seed) -> pd.DataFrame:
     sampler = _resolve_pat_sampler(
         config.get('pat_distr_ents', None),
@@ -146,16 +172,6 @@ def create_entity2id(config, seed) -> pd.DataFrame:
         'wt': wts,
     })
 
-# def create_relation2id(config, seed) -> pd.DataFrame:
-#     if config['pat_distr_rels']:
-#         wts = config['pat_distr_rels'](config['n_rels'], seed)
-#     else:
-#         wts = [1]*config['n_rels']
-#     return pd.DataFrame({
-#         'name': range(config['n_rels']),
-#         'id': range(config['n_rels']),
-#         'wt': wts,
-#     })
 def create_relation2id(config, seed) -> pd.DataFrame:
     sampler = _resolve_pat_sampler(
         config.get('pat_distr_rels', None),
@@ -549,36 +565,6 @@ def run(config: 'Dict[str,]', run_id: int):
                 parts.append(f"{k}={v}")
         return "|".join(parts)
     
-    # def _match_antecedents_rev_with_paths(edgelist, ants_rev, lags_rev, idxs_rev, t_anchors, mapping, path):
-    #     """
-    #     Like _match_antecedents_rev, but yields (mapping, path) where path is a list of
-    #     (antecedent_original_index, edgelist_row_index). ants_rev/lags_rev/idxs_rev must be
-    #     in reverse order (newest -> oldest).
-    #     """
-    #     if not ants_rev:
-    #         yield mapping, path
-    #         return
-
-    #     ant = ants_rev[0]
-    #     lag = lags_rev[0]
-    #     rest_ants = ants_rev[1:]
-    #     rest_lags = lags_rev[1:]
-    #     rest_idxs = idxs_rev[1:]
-
-    #     for t_anchor in t_anchors:
-    #         cand = _candidate_rows_for_ant(edgelist, ant, t_anchor, lag)
-    #         if cand.empty:
-    #             continue
-    #         # Keep original edgelist index so we can label exact edges
-    #         for row in cand.itertuples(index=True, name='E'):
-    #             new_map = _consistent_extend(mapping, ant, row)
-    #             if new_map is None:
-    #                 continue
-    #             new_path = path + [(idxs_rev[0], int(row.Index))]
-    #             # anchor steps back to this row's time
-    #             yield from _match_antecedents_rev_with_paths(
-    #                 edgelist, rest_ants, rest_lags, rest_idxs, [int(row.t)], new_map, new_path
-    #             )
     def _match_antecedents_rev_with_paths(edgelist, ants, lags, t_anchors, step, mapping, path):
         """
         Backtrack over antecedents from newest to oldest, carrying *original* indices.
@@ -1030,130 +1016,134 @@ def run(config: 'Dict[str,]', run_id: int):
         dbg(f"[ALIAS] After unique-ifying: {dup_cnt} rows still share 'pattern' list objects (unexpected).")
 
     # Post-creation, placeholder-aware labeling with roles and bindings
-    dbg('Labelling ...')
-    # Buffer labels and write once at the end
-    labels_buffer = defaultdict(set)
-    for label, pattern_id in zip(pattern2id['pattern'], pattern2id['id']):
-        _cand_cache = {}
+    if not config.get('skip_labeling', False):
+        dbg('Labelling ...')
+        # Buffer labels and write once at the end
+        # labels_buffer = defaultdict(set)
+        for label, pattern_id in zip(pattern2id['pattern'], pattern2id['id']):
+            _cand_cache = {}
 
-        pattern = TemporalPattern()
-        pattern.from_label(label)
-        dbg('Labelling pattern:', pattern.__label__())
-        
-        # ants = list(pattern.antecedent)
-        raw_ants = list(pattern.antecedent)
-        ants = [(_norm_ph(h), r, _norm_ph(ta)) for (h, r, ta) in raw_ants]
+            pattern = TemporalPattern()
+            pattern.from_label(label)
+            dbg('Labelling pattern:', pattern.__label__())
+            
+            # ants = list(pattern.antecedent)
+            raw_ants = list(pattern.antecedent)
+            ants = [(_norm_ph(h), r, _norm_ph(ta)) for (h, r, ta) in raw_ants]
 
-        # cons_h, cons_r, cons_ta = pattern.consequence
-        ch, cr, cta = pattern.consequence
-        cons_h, cons_r, cons_ta = _norm_ph(ch), cr, _norm_ph(cta)
+            # cons_h, cons_r, cons_ta = pattern.consequence
+            ch, cr, cta = pattern.consequence
+            cons_h, cons_r, cons_ta = _norm_ph(ch), cr, _norm_ph(cta)
 
-        lags = list(pattern.time_lags)
+            lags = list(pattern.time_lags)
 
-        # Reverse for backtracking and carry original antecedent indices
-        ants_rev = ants[::-1]
-        lags_rev = lags[::-1]
-        idxs_rev = list(range(len(ants)-1, -1, -1))
+            # Reverse for backtracking and carry original antecedent indices
+            ants_rev = ants[::-1]
+            lags_rev = lags[::-1]
+            idxs_rev = list(range(len(ants)-1, -1, -1))
 
-        # All placeholders used anywhere in this pattern
-        placeholders = _pattern_placeholders(ants, (cons_h, cons_r, cons_ta))
+            # All placeholders used anywhere in this pattern
+            placeholders = _pattern_placeholders(ants, (cons_h, cons_r, cons_ta))
 
-        # Candidate consequence edges by relation and any concrete head/tail
-        mask = (edgelist['rel'] == cons_r)
-        if not _is_ph(cons_h):
-            mask &= (edgelist['head'] == cons_h)
-        if not _is_ph(cons_ta):
-            mask &= (edgelist['tail'] == cons_ta)
+            # Candidate consequence edges by relation and any concrete head/tail
+            mask = (edgelist['rel'] == cons_r)
+            if not _is_ph(cons_h):
+                mask &= (edgelist['head'] == cons_h)
+            if not _is_ph(cons_ta):
+                mask &= (edgelist['tail'] == cons_ta)
 
-        same_ph_cons = (_is_ph(cons_h) and _is_ph(cons_ta) and cons_h == cons_ta)
+            same_ph_cons = (_is_ph(cons_h) and _is_ph(cons_ta) and cons_h == cons_ta)
 
-        cand_df = edgelist.loc[mask, ['head', 'tail', 't']]
-        if same_ph_cons:
-            cand_df = cand_df[cand_df['head'] == cand_df['tail']]
-
-        # Group by exact consequence triple+time; do the search once per distinct group
-        for (h_val, ta_val, t_anchor), group_index in cand_df.groupby(['head','tail','t'], sort=False).groups.items():
-            idxs = list(group_index)   # all row indices with this exact (h, r, t, tail)
-
-            # Seed placeholders from the consequence itself
-            init_map = {}
+            cand_df = edgelist.loc[mask, ['head', 'tail', 't']]
             if same_ph_cons:
-                # head==tail already guaranteed by prefilter
-                if not _seed(init_map, cons_h, h_val):   # cons_h == cons_ta here
-                    continue
-            else:
-                if _is_ph(cons_h) and not _seed(init_map, cons_h, h_val):
-                    continue
-                if _is_ph(cons_ta) and not _seed(init_map, cons_ta, ta_val):
-                    continue
+                cand_df = cand_df[cand_df['head'] == cand_df['tail']]
 
-            if not _all_diff_ok(init_map):
-                continue
+            # Group by exact consequence triple+time; do the search once per distinct group
+            for (h_val, ta_val, t_anchor), group_index in cand_df.groupby(['head','tail','t'], sort=False).groups.items():
+                idxs = list(group_index)   # all row indices with this exact (h, r, t, tail)
 
-            # 0-hop pattern: just label all rows in this group
-            if len(ants) == 0:
-                bind_str = _binding_to_str(init_map, placeholders)
-                lab_c = f"{pattern_id}_c_{bind_str}"
-                for idx in idxs:
-                    _append_label(idx, lab_c)
-                continue
-
-            seen_role_binding = set()
-
-            # Run the backtracker ONCE for this (h_val, ta_val, t_anchor)
-            for mapping, path in _match_antecedents_rev_with_paths(
-                edgelist=edgelist, ants=ants, lags=lags,
-                t_anchors=[int(t_anchor)], step=0, mapping=init_map, path=[],
-            ):
-                # Guard: mapping must reproduce this consequence (should pass now that we seeded)
-                exp_h = mapping[cons_h] if _is_ph(cons_h) else cons_h
-                exp_t = mapping[cons_ta] if _is_ph(cons_ta) else cons_ta
-                if (int(h_val) != int(exp_h)) or (int(ta_val) != int(exp_t)):
-                    if mis_budget[(pattern_id, 'c-guard')] < MIS_LIMIT:
-                        dbg(f"[MIS:c-guard] pid={pattern_id} row=({int(h_val)},{int(cons_r)},{int(ta_val)}) "
-                            f"exp=({int(exp_h)},{int(cons_r)},{int(exp_t)}) mapping={mapping}")
-                    mis_budget[(pattern_id, 'c-guard')] += 1
-                    continue
-
-                bind_str = _binding_to_str(mapping, placeholders)
-
-                # Label antecedents used by this instantiation
-                for ante_idx, edge_idx in path:
-                    # Never tag the same row as both consequence and antecedent
-                    if edge_idx in idxs:
+                # Seed placeholders from the consequence itself
+                init_map = {}
+                if same_ph_cons:
+                    # head==tail already guaranteed by prefilter
+                    if not _seed(init_map, cons_h, h_val):   # cons_h == cons_ta here
                         continue
-                    ant = ants[ante_idx]
-                    ah = mapping[_norm_ph(ant[0])] if _is_ph(_norm_ph(ant[0])) else _norm_ph(ant[0])
-                    ar = ant[1]
-                    at = mapping[_norm_ph(ant[2])] if _is_ph(_norm_ph(ant[2])) else _norm_ph(ant[2])
-
-                    er_head = int(edgelist.at[edge_idx, 'head'])
-                    er_rel  = int(edgelist.at[edge_idx, 'rel'])
-                    er_tail = int(edgelist.at[edge_idx, 'tail'])
-                    if (er_head != int(ah)) or (er_rel != int(ar)) or (er_tail != int(at)):
-                        if mis_budget[(pattern_id, 'a')] < MIS_LIMIT:
-                            dbg(f"[MIS:a] pid={pattern_id} ante_idx={ante_idx} edge_idx={edge_idx} "
-                                f"row=({er_head},{er_rel},{er_tail}) exp=({int(ah)},{int(ar)},{int(at)}) "
-                                f"bind={bind_str}")
-                        mis_budget[(pattern_id, 'a')] += 1
+                else:
+                    if _is_ph(cons_h) and not _seed(init_map, cons_h, h_val):
+                        continue
+                    if _is_ph(cons_ta) and not _seed(init_map, cons_ta, ta_val):
                         continue
 
-                    lab_a = f"{pattern_id}_a{ante_idx}_{bind_str}"
-                    if lab_a not in seen_role_binding:
-                        _append_label(edge_idx, lab_a)
-                        seen_role_binding.add(lab_a)
+                if not _all_diff_ok(init_map):
+                    continue
 
-                # Label the consequence for ALL rows in this group (same binding)
-                lab_c = f"{pattern_id}_c_{bind_str}"
-                for idx in idxs:
-                    if lab_c not in seen_role_binding:
+                # 0-hop pattern: just label all rows in this group
+                if len(ants) == 0:
+                    bind_str = _binding_to_str(init_map, placeholders)
+                    lab_c = f"{pattern_id}_c_{bind_str}"
+                    for idx in idxs:
                         _append_label(idx, lab_c)
-    
-    dbg('Finished labelling')
+                    continue
 
-    # Validity check: check that every label matches its row.
-    dbg('[VAL] checking label integrity ...')
-    _validate_labels(edgelist, pattern2id)
+                seen_role_binding = set()
+
+                # Run the backtracker ONCE for this (h_val, ta_val, t_anchor)
+                for mapping, path in _match_antecedents_rev_with_paths(
+                    edgelist=edgelist, ants=ants, lags=lags,
+                    t_anchors=[int(t_anchor)], step=0, mapping=init_map, path=[],
+                ):
+                    # Guard: mapping must reproduce this consequence (should pass now that we seeded)
+                    exp_h = mapping[cons_h] if _is_ph(cons_h) else cons_h
+                    exp_t = mapping[cons_ta] if _is_ph(cons_ta) else cons_ta
+                    if (int(h_val) != int(exp_h)) or (int(ta_val) != int(exp_t)):
+                        if mis_budget[(pattern_id, 'c-guard')] < MIS_LIMIT:
+                            dbg(f"[MIS:c-guard] pid={pattern_id} row=({int(h_val)},{int(cons_r)},{int(ta_val)}) "
+                                f"exp=({int(exp_h)},{int(cons_r)},{int(exp_t)}) mapping={mapping}")
+                        mis_budget[(pattern_id, 'c-guard')] += 1
+                        continue
+
+                    bind_str = _binding_to_str(mapping, placeholders)
+
+                    # Label antecedents used by this instantiation
+                    for ante_idx, edge_idx in path:
+                        # Never tag the same row as both consequence and antecedent
+                        if edge_idx in idxs:
+                            continue
+                        ant = ants[ante_idx]
+                        ah = mapping[_norm_ph(ant[0])] if _is_ph(_norm_ph(ant[0])) else _norm_ph(ant[0])
+                        ar = ant[1]
+                        at = mapping[_norm_ph(ant[2])] if _is_ph(_norm_ph(ant[2])) else _norm_ph(ant[2])
+
+                        er_head = int(edgelist.at[edge_idx, 'head'])
+                        er_rel  = int(edgelist.at[edge_idx, 'rel'])
+                        er_tail = int(edgelist.at[edge_idx, 'tail'])
+                        if (er_head != int(ah)) or (er_rel != int(ar)) or (er_tail != int(at)):
+                            if mis_budget[(pattern_id, 'a')] < MIS_LIMIT:
+                                dbg(f"[MIS:a] pid={pattern_id} ante_idx={ante_idx} edge_idx={edge_idx} "
+                                    f"row=({er_head},{er_rel},{er_tail}) exp=({int(ah)},{int(ar)},{int(at)}) "
+                                    f"bind={bind_str}")
+                            mis_budget[(pattern_id, 'a')] += 1
+                            continue
+
+                        lab_a = f"{pattern_id}_a{ante_idx}_{bind_str}"
+                        if lab_a not in seen_role_binding:
+                            _append_label(edge_idx, lab_a)
+                            seen_role_binding.add(lab_a)
+
+                    # Label the consequence for ALL rows in this group (same binding)
+                    lab_c = f"{pattern_id}_c_{bind_str}"
+                    for idx in idxs:
+                        if lab_c not in seen_role_binding:
+                            _append_label(idx, lab_c)
+        
+        dbg('Finished labelling')
+
+        # Validity check: check that every label matches its row.
+        dbg('[VAL] checking label integrity ...')
+        _validate_labels(edgelist, pattern2id)
+    else:
+        # Skiping labeling greatly speeds up trials in optimize_tkg.py
+        dbg('Skipping labeling and validation')
 
     # Cut off edgelist at n_tws (because forced patterns may have extended past n_tws)
     edgelist = edgelist[edgelist['t'] < config['n_tws']]
@@ -1229,8 +1219,8 @@ def run(config: 'Dict[str,]', run_id: int):
     test_df[cols_export].to_csv(
         os.path.join(export_dir, 'test.txt'), sep='\t', index=False, header=False)
     
-    # Copy config to export directory, for reproducibility
-    shutil.copy2('config.py', export_dir)
+    # Write config to export directory, for reproducibility
+    dump_config_snapshot(export_dir, config)
 
     # Pattern instantiation summary (based on construction counts)
     summary = pattern2id[['id', 'pattern', 'n_hops']].copy()

@@ -26,3 +26,4 @@ python3 optimize_tkg.py \
 ```
 
 This will create a directory `opt_runs` with `N` trial, synthetic TKGs and optimize for the similarity of these synthetic TKGs to the reference TKG. The best synthetic TKG will also be copied to `opt_runs/best_trial`.
+
