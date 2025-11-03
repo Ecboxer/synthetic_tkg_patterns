@@ -1,25 +1,33 @@
 # Base config
 import scipy
 
-
 configs = [
     # Uniform distribution over entities and relations
     {
+        # KG/TKG toggle
+        'graph_mode': 'tkg',
+
         # Path information
         # Export directory
-        'export_dir': 'data_temp',
+        'export_dir': 'opt_runs_icews14_20251022_best',
 
         # Seed: int for reproducibility or None for random generation
-        'seed': 0,
+        'seed': 367,
 
         # Debug: Controls debug print statements
         'debug': False,
 
         # Train-Valid-Test split
         'split': (.8, .1, .1),
+        # For KG setting only: all, consequence_only
+        'split_on': 'consequence_only',
 
         # Skip backtracking to instantiate consequences and emit them directly
         'fast_force_consequence': True,
+
+        # Skips matching for emergent patterns (caused by pattern interactions that
+        # could occur if prevent_quad_collision is False)
+        'skip_generation_matcher': True,
 
         # Basic stats
         # Number of runs, each run will have a dedicated directory inside export_dir
@@ -37,11 +45,11 @@ configs = [
         # Distribution over entities, determining which are used to populate pattern templates.
         # Should be a function taking a number of entities as input and returning the same number
         # of weights. Defaults to uniform distribution
-        'pat_distr_ents': '/nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14',  #lambda x, seed: scipy.stats.gamma.rvs(1, loc=0, scale=2, size=x, random_state=seed),
+        'pat_distr_ents': lambda x, seed: scipy.stats.gamma.rvs(1, loc=0, scale=2, size=x, random_state=seed),
         # Distribution over relations, determining which are used to populate pattern templates
         # Should be a function taking a number of relations as input and returning the same number
         # of weights. Defaults to uniform distribution
-        'pat_distr_rels': '/nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14',  #lambda x, seed: scipy.stats.gamma.rvs(1, loc=0, scale=2, size=x, random_state=seed),
+        'pat_distr_rels': lambda x, seed: scipy.stats.gamma.rvs(1, loc=0, scale=2, size=x, random_state=seed),
         # Whether patterns must be composed of unique triples (i.e., no antecedents or consequence
         # within the same pattern can share the same (head, relation, tail) triple)
         'require_unique_triples': True,
@@ -55,6 +63,12 @@ configs = [
         # entity (with the same restriction on the consequence and the first and last antecedents) and
         # be 2-regular. Functionally, this requires "cycle"-format rules, like TLogic's.
         'require_sequential_rule': False,
+        # Prevent quadruples (h, r, o, t) from being attributed to multiple patterns. We do this by preventing
+        # instantiations of patterns that would lead to such collisions, so this doesn't bias the TKG generation,
+        # just produce simpler, less noisy TKGs.
+        'prevent_quad_collisions': True,
+        # Maximum number of times to try to resample a pattern for instantiation, to prevent quadruple collision
+        'max_instantiation_resamples': 20,
         # Number of 3-hop patterns
         'n_3_hop': 100,
         # Time lag for 3-hop patterns

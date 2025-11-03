@@ -1,0 +1,18 @@
+{
+  "relerr_n_ents": 0.28170594837261503,
+  "absdiff_n_ents": -2008.0,
+  "relerr_n_rels": 0.1,
+  "absdiff_n_rels": -23.0,
+  "relerr_n_tws": 0.0,
+  "absdiff_n_tws": 0.0,
+  "relerr_n_quads": 0.08782100738454755,
+  "absdiff_n_quads": -7968.0,
+  "relerr_n_unique_triples": 0.3350830102395864,
+  "absdiff_n_unique_triples": 16853.0,
+  "relerr_avg_degree": 0.2699241912818253,
+  "absdiff_avg_degree": 6.871554959315379,
+  "relerr_deg_p25": 1.0,
+  "absdiff_deg_p25": 1.0,
+  "relerr_deg_p75": 0.0,
+  "absdiff_deg_p75": 0.0
+}

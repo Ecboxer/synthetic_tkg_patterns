@@ -1,0 +1,22 @@
+{
+  "seed_base": 0,
+  "n_ents": 7128,
+  "n_rels": 230,
+  "n_tws": 365,
+  "_pat_distr_ents_choice": "zipf(s=1.2,q=1.0)",
+  "_pat_distr_rels_choice": "pareto(a=1.6,xm=1.0)",
+  "n_1_hop": 303,
+  "n_2_hop": 57,
+  "n_3_hop": 93,
+  "require_unique_triples": true,
+  "prohibit_selfconnections": false,
+  "prohibit_new_consequence_relations": false,
+  "require_sequential_rule": false,
+  "prevent_quad_collisions": true,
+  "use_density_dist": false,
+  "rnd_avg_density": 0,
+  "p_skip_consequence": 0,
+  "use_force_distr": false,
+  "p_force": 0.1,
+  "n_force": 2
+}

@@ -210,6 +210,7 @@ def make_config_from_trial(
     cfg['prohibit_selfconnections'] = bool(trial_params['prohibit_selfconnections'])
     cfg['prohibit_new_consequence_relations'] = bool(trial_params['prohibit_new_consequence_relations'])
     cfg['require_sequential_rule'] = bool(trial_params['require_sequential_rule'])
+    cfg['prevent_quad_collisions'] = bool(trial_params['prevent_quad_collisions'])
 
     # Pass resolved samplers (or None for uniform)
     cfg['pat_distr_ents'] = trial_params.get('_pat_distr_ents_fn', None)
@@ -264,6 +265,55 @@ def make_config_from_trial(
 
     return cfg
 
+def rehydrate_config_for_labeled_pass(
+    base_cfg: dict,
+    best_params: dict,
+    ref_tkg_dir: str,
+    export_root: str,
+    trial_id: int,
+) -> dict:
+    """
+    Build a clean, runnable config for the labeled rerun:
+      - Recreate the same trial config (sizes, counts, seeds) via make_config_from_trial.
+      - Re-map pat_distr_* categorical choices back to real callables.
+      - Restore callable distributions from base_cfg where needed.
+      - Force skip_labeling=False and put outputs under <export_root>/best_trial_labeled.
+    """
+    # Start from the SAME construction path the trial used
+    cfg = make_config_from_trial(
+        base_config=base_cfg,
+        trial_params=deepcopy(best_params),
+        export_dir=export_root,
+        trial_id=trial_id,
+    )
+
+    # Recreate samplers exactly as in the trial
+    choice_to_sampler = build_choice_to_sampler(ref_tkg_dir)
+    e_choice = best_params.get("pat_distr_ents", "uniform")
+    r_choice = best_params.get("pat_distr_rels", "uniform")
+    cfg["pat_distr_ents"] = choice_to_sampler(e_choice, "ents")
+    cfg["pat_distr_rels"] = choice_to_sampler(r_choice, "rels")
+
+    # Ensure forced-instantiation distribution callables exist if trials used them
+    nhd = cfg.get("n_hops2n_force_distr", None)
+    if not (isinstance(nhd, dict) and all((v is None or callable(v)) for v in nhd.values())):
+        cfg["n_hops2n_force_distr"] = deepcopy(base_cfg.get("n_hops2n_force_distr", {1: None, 2: None, 3: None}))
+
+    # Random wiring sampler: keep what the trial used; guard against accidental JSONification
+    if cfg.get("rnd_avg_density_distr") is not None and not callable(cfg["rnd_avg_density_distr"]):
+        cfg["rnd_avg_density_distr"] = None  # trials in this code path used density, not a distribution callable
+
+    # Time lag specs: keep original base callables/tuples (trials never mutate these)
+    for key in ("time_lag_1_hop", "time_lag_2_hop", "time_lag_3_hop"):
+        cfg[key] = deepcopy(base_cfg.get(key, []))
+
+    # Final labeled pass settings
+    cfg["skip_labeling"] = False
+    cfg["export_dir"] = os.path.join(export_root, "best_trial_labeled")
+    os.makedirs(cfg["export_dir"], exist_ok=True)
+
+    return cfg
+
 
 # Distribution helpers for pat_distr_*
 def _empirical_probs_entities(df: pd.DataFrame) -> np.ndarray:
@@ -298,6 +348,50 @@ def make_gamma_weight_sampler(shape: float, scale: float):
     return sampler
 
 
+def make_zipf_weight_sampler(s: float = 1.3, q: float = 1.0):
+    import numpy as np
+    def sampler(n: int, seed=None):
+        rng = _rng_from_seed(seed)
+        ranks = np.arange(1, int(n) + 1, dtype=float)
+        w = 1.0 / np.power(ranks + q, s)
+        # tiny jitter for ties
+        w = w / w.sum()
+        # Return weights, not a categorical sample
+        # shuffle to avoid perfect correlation with id order
+        rng.shuffle(w)
+        return w
+    return sampler
+
+
+def make_pareto_weight_sampler(alpha: float = 1.4, xm: float = 1.0, cap: float = None):
+    import numpy as np
+    def sampler(n: int, seed=None):
+        rng = _rng_from_seed(seed)
+        w = rng.pareto(alpha, size=int(n)) + 1.0
+        w = w * xm
+        if cap is not None:
+            w = np.minimum(w, cap)
+        return w
+    return sampler
+
+
+def make_lognorm_weight_sampler(mu: float = 0.0, sigma: float = 1.2):
+    def sampler(n: int, seed=None):
+        import numpy as np
+        rng = _rng_from_seed(seed)
+        return rng.lognormal(mean=mu, sigma=sigma, size=int(n))
+    return sampler
+
+
+def make_negbin_weight_sampler(r: float = 1.5, p: float = 0.3):
+    def sampler(n: int, seed=None):
+        import numpy as np
+        rng = _rng_from_seed(seed)
+        # add 1 to avoid zeros, then as float weights
+        return rng.negative_binomial(r, p, size=int(n)).astype(float) + 1.0
+    return sampler
+
+
 def build_choice_to_sampler(ref_tkg_dir: str):
     """
     Returns a function choice_to_sampler(choice, which) that maps a string choice
@@ -307,16 +401,38 @@ def build_choice_to_sampler(ref_tkg_dir: str):
     emp_ent = make_empirical_weight_sampler(_empirical_probs_entities(ref_df))
     emp_rel = make_empirical_weight_sampler(_empirical_probs_relations(ref_df))
 
+    # preset menu -> callable factory
+    MENU = {
+        # existing
+        **{name: (lambda sh=sc[0], sca=sc[1]: make_gamma_weight_sampler(sh, sca))
+           for name, sc in GAMMA_OPTIONS.items()},
+        # new: zipf
+        "zipf(s=1.2,q=1.0)": (lambda: make_zipf_weight_sampler(1.2, 1.0)),
+        "zipf(s=1.4,q=1.0)": (lambda: make_zipf_weight_sampler(1.4, 1.0)),
+        "zipf(s=1.7,q=0.5)": (lambda: make_zipf_weight_sampler(1.7, 0.5)),
+        # new: pareto
+        "pareto(a=1.3,xm=1.0)": (lambda: make_pareto_weight_sampler(1.3, 1.0)),
+        "pareto(a=1.6,xm=1.0)": (lambda: make_pareto_weight_sampler(1.6, 1.0)),
+        # new: lognormal
+        "lognorm(mu=0,s=1.0)": (lambda: make_lognorm_weight_sampler(0.0, 1.0)),
+        "lognorm(mu=0,s=1.4)": (lambda: make_lognorm_weight_sampler(0.0, 1.4)),
+        # new: negbin
+        "negbin(r=1.2,p=0.35)": (lambda: make_negbin_weight_sampler(1.2, 0.35)),
+        "negbin(r=2.0,p=0.25)": (lambda: make_negbin_weight_sampler(2.0, 0.25)),
+    }
+
     def choice_to_sampler(choice: str, which: str):
         if choice == "uniform":
             return None
         if choice == "empirical":
             return emp_ent if which == "ents" else emp_rel
+        if choice in MENU:
+            return MENU[choice]()
         if choice in GAMMA_OPTIONS:
             sh, sc = GAMMA_OPTIONS[choice]
             return make_gamma_weight_sampler(sh, sc)
         raise ValueError(f"Unknown distribution choice: {choice}")
-
+    
     return choice_to_sampler
 
 
@@ -695,8 +811,17 @@ def objective_factory(
     
     # Define choices & mapping for pat_distr_*
     choice_to_sampler = build_choice_to_sampler(ref_tkg_dir)
-    distr_choices = ["uniform", "empirical"] + list(GAMMA_OPTIONS.keys())
-
+    distr_choices = (
+        ["uniform", "empirical"]
+        + list(GAMMA_OPTIONS.keys())
+        + [
+            "zipf(s=1.2,q=1.0)", "zipf(s=1.4,q=1.0)", "zipf(s=1.7,q=0.5)",
+            "pareto(a=1.3,xm=1.0)", "pareto(a=1.6,xm=1.0)",
+            "lognorm(mu=0,s=1.0)", "lognorm(mu=0,s=1.4)",
+            "negbin(r=1.2,p=0.35)", "negbin(r=2.0,p=0.25)",
+        ]
+    )
+    
     def objective_optuna(trial):
         # Suggest params
         params = {}
@@ -734,6 +859,7 @@ def objective_factory(
         params['require_sequential_rule'] = trial.suggest_categorical(
             "require_sequential_rule", [False, True]
         )
+        params['prevent_quad_collisions'] = True  # EB: Fix to True
 
         # Random wiring mode (disabled)
         params['use_density_dist'] = False
@@ -830,7 +956,7 @@ def objective_factory(
                 'n_ents','n_rels','n_tws','n_1_hop','n_2_hop','n_3_hop',
                 'require_unique_triples','prohibit_selfconnections',
                 'prohibit_new_consequence_relations','require_sequential_rule',
-                'rnd_avg_density','p_skip_consequence'
+                'prevent_quad_collisions','rnd_avg_density','p_skip_consequence'
             ] if k in cfg
         } | {
             'pat_distr_ents': params.get('_pat_distr_ents_choice'),
@@ -902,10 +1028,12 @@ def main():
         'n_tws': 50,
         'pat_distr_ents': None,
         'pat_distr_rels': None,
-        'require_unique_triples': False,
+        'require_unique_triples': True,
         'prohibit_selfconnections': False,
         'prohibit_new_consequence_relations': True,
         'require_sequential_rule': False,
+        'prevent_quad_collisions': True,
+        'max_instantiation_resamples': 20,
         'n_3_hop': 10,
         # Defined here
         'time_lag_3_hop': [
@@ -1007,28 +1135,15 @@ def main():
     if args.skip_labeling:
         try:
             print("\n[post] Re-running best trial with labeling enabled...")
-
-            # Map the saved choices back to samplers (same logic as during trials)
-            choice_to_sampler = build_choice_to_sampler(args.ref_tkg_dir)
-
             best_params = dict(study.best_trial.params)
-            best_params["_pat_distr_ents_fn"] = choice_to_sampler(best_params["pat_distr_ents"], "ents")
-            best_params["_pat_distr_rels_fn"] = choice_to_sampler(best_params["pat_distr_rels"], "rels")
-            best_params["_pat_distr_ents_choice"] = best_params["pat_distr_ents"]
-            best_params["_pat_distr_rels_choice"] = best_params["pat_distr_rels"]
 
-            # Build the *same* config the trial used (same seed scheme). 
-            labeled_cfg = make_config_from_trial(
-                base_config=base_config,
-                trial_params=best_params,
-                export_dir=args.export_root,
+            labeled_cfg = rehydrate_config_for_labeled_pass(
+                base_cfg=base_config,
+                best_params=best_params,
+                ref_tkg_dir=args.ref_tkg_dir,
+                export_root=args.export_root,
                 trial_id=study.best_trial.number,
             )
-
-            # Only edit labeling and export dir
-            labeled_cfg["skip_labeling"] = False
-            labeled_cfg["export_dir"] = os.path.join(args.export_root, "best_trial_labeled")
-            os.makedirs(labeled_cfg["export_dir"], exist_ok=True)
 
             generate_one(labeled_cfg, run_id=0)
             print(f"[post] Labeled best trial written to: {labeled_cfg['export_dir']}")
@@ -1041,25 +1156,27 @@ if __name__ == "__main__":
 
 """
 Run commands:
-# ckg09 Trial 59
-python3 optimize_tkg.py \
-    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
-    --budget 200 \
-    --recency_k '1,3,10' \
-    --frequency_k '1,3,10' \
-    --history_len '3,10' \
-    --baseline_weight 1.0 \
-    --export_root opt_runs_icews14_20250930
-
-# ckg05
+# INPROG ckg08
 python3 optimize_tkg.py \
     --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
     --budget 400 \
+    --skip_labeling \
     --recency_k '1,3,10' \
     --frequency_k '1,3,10' \
     --history_len '3,10' \
     --baseline_weight 10.0 \
-    --export_root opt_runs_icews14_20251001 \
+    --export_root opt_runs_icews14_20251022
+
+# INPROG ckg05
+python3 optimize_tkg.py \
+    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
+    --budget 800 \
+    --skip_labeling \
+    --recency_k '1,3,10' \
+    --frequency_k '1,3,10' \
+    --history_len '3,10' \
+    --baseline_weight 1000.0 \
+    --export_root opt_runs_icews14_20251022_bw1000
 
 # DONE
 python3 optimize_tkg.py \

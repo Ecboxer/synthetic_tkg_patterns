@@ -1,0 +1,11 @@
+{
+  "recency@1": 0.08,
+  "recency@3": 0.1612,
+  "recency@10": 0.2292,
+  "frequency(h=3)@1": 0.093,
+  "frequency(h=3)@3": 0.159,
+  "frequency(h=3)@10": 0.159,
+  "frequency(h=10)@1": 0.141,
+  "frequency(h=10)@3": 0.179,
+  "frequency(h=10)@10": 0.2208
+}

@@ -190,9 +190,10 @@ def create_relation2id(config, seed) -> pd.DataFrame:
     })
 
 def create_time2id(config) -> pd.DataFrame:
+    n = 1 if str(config.get('graph_mode','tkg')).lower() == 'kg' else int(config['n_tws'])
     return pd.DataFrame({
-        'name': range(config['n_tws']),
-        'id': range(config['n_tws']),
+        'name': range(n),
+        'id': range(n),
     })
 
 def create_pattern2id(patterns: 'List[TemporalPattern]') -> pd.DataFrame:
@@ -210,7 +211,12 @@ def create_edgelist() -> pd.DataFrame:
         't': [],
         'wt': [],
         'pattern': [],
+        'is_antecedent': [],
+        'is_consequence': [],
     })
+
+# Reusable empty view for fast returns
+EMPTY_VIEW = pd.DataFrame({'head': [], 'rel': [], 'tail': [], 't': []})
 
 def add_new_pattern(
     config: 'Dict[str,]',
@@ -384,6 +390,69 @@ def _validate_labels(edgelist, pattern2id_df, max_bad=50):
                     bad += 1
                     if bad >= max_bad: return
 
+class _RelIndex:
+    __slots__ = ("t", "head", "tail", "row_idx")
+    def __init__(self, t, head, tail, row_idx):
+        order = np.argsort(t, kind="mergesort")  # stable order
+        self.t = t[order]
+        self.head = head[order]
+        self.tail = tail[order]
+        self.row_idx = row_idx[order]
+    def window(self, t_min, t_max):
+        # Return [lo, hi) of rows with t in [t_min, t_max]
+        lo = np.searchsorted(self.t, t_min, side="left")
+        hi = np.searchsorted(self.t, t_max, side="right")
+        return lo, hi
+
+class _RelIndexLive:
+    # append-only, assumes t is non-decreasing across appends
+    def __init__(self):
+        self.r2 = defaultdict(lambda: {"t": [], "head": [], "tail": [], "row_idx": []})
+        self.n_rows = 0  # total rows seen so far, to compute row_idx
+
+    def append_df(self, df):
+        if df is None or df.empty:
+            return
+        # NB: rely on current df index positions to create row_idx:
+        # we add after concatenating df to edgelist, so we pass the *global* row indices
+        for i, (h, r, t, ta, idx) in enumerate(df[['head','rel','t','tail']].assign(__idx=df.index).itertuples(index=False, name=None)):
+            bucket = self.r2[int(r)]
+            bucket["t"].append(int(t))
+            bucket["head"].append(int(h))
+            bucket["tail"].append(int(ta))
+            bucket["row_idx"].append(int(idx))
+
+    def get(self, r):
+        d = self.r2.get(int(r))
+        if not d:
+            return None
+        # use numpy views for fast slicing
+        return _RelIndex(
+            t=np.asarray(d["t"], dtype=np.int64),
+            head=np.asarray(d["head"], dtype=np.int64),
+            tail=np.asarray(d["tail"], dtype=np.int64),
+            row_idx=np.asarray(d["row_idx"], dtype=np.int64),
+        )
+
+def _build_rel_index_frame(df):
+    # Build a small index per relation: arrays are int64 and contiguous
+    arr_rel  = df["rel"].to_numpy(np.int64, copy=False)
+    arr_head = df["head"].to_numpy(np.int64, copy=False)
+    arr_tail = df["tail"].to_numpy(np.int64, copy=False)
+    arr_t    = df["t"].to_numpy(np.int64, copy=False)
+    arr_idx  = np.arange(df.shape[0], dtype=np.int64)
+    rel2idx = {}
+    # group by unique relation ids (fast path for candidate search)
+    for r in np.unique(arr_rel):
+        m = (arr_rel == r)
+        rel2idx[int(r)] = _RelIndex(
+            t=arr_t[m].copy(),
+            head=arr_head[m].copy(),
+            tail=arr_tail[m].copy(),
+            row_idx=arr_idx[m].copy(),
+        )
+    return rel2idx
+
 def run(config: 'Dict[str,]', run_id: int):
     """ Create TKGs according to configuration from config.py file
     """
@@ -399,6 +468,12 @@ def run(config: 'Dict[str,]', run_id: int):
     # Skip backtracking to instantiate consequences if there's no random wiring
     FAST_FORCE_CONSEQUENCE = bool(config.get('fast_force_consequence', True))
     NO_RANDOM_WIRING = (config.get('rnd_avg_density_distr') is None and float(config.get('rnd_avg_density', 0.0)) <= 0.0)
+    SKIP_LABEL = bool(config.get('skip_labeling', False))
+    FAST_AND_NO_RAND = (FAST_FORCE_CONSEQUENCE and NO_RANDOM_WIRING)
+    SKIP_GEN_MATCHER = bool(config.get('skip_generation_matcher', False))
+
+    # Recognize KG mode
+    IS_KG = (str(config.get('graph_mode', 'tkg')).lower() == 'kg')
 
     def dbg(*args, **kwargs):
         if DEBUG:
@@ -481,35 +556,89 @@ def run(config: 'Dict[str,]', run_id: int):
     def _candidate_rows_for_ant(edgelist, ant, t_curr, lag):
         """
         Get candidate rows for antecedent ant given current time anchor t_curr and
-        lag = (min, max) interpreted as: t_ant ∈ [t_curr - max, t_curr - min]. Only
-        filter by concrete head/tail (if available) and by relation and time.
+        lag = (min, max) interpreted as: t_ant ∈ [t_curr - max, t_curr - min].
+
+        Uses the live per-relation time index during generation (rel2idx_live),
+        falling back to the finalized index (rel2idx_local) during labeling,
+        and finally to Pandas masks.
         """
         h, r, ta = _norm_ph(ant[0]), ant[1], _norm_ph(ant[2])
-        key = _ante_cache_key((h, r, ta), t_curr, tuple(lag))
+
+        key = _ante_cache_key((h, r, ta), int(t_curr), tuple(lag))
         cached = _cand_cache.get(key)
         if cached is not None:
             return cached
 
-        min_lag, max_lag = lag
-        # Doing retrospective filtering, so t_min and t_max use max_lag and min_lag, respectively
-        t_min = t_curr - max_lag
-        t_max = t_curr - min_lag
-        mask = (
-            (edgelist['rel'] == r) &
-            (edgelist['t'] >= t_min) &
-            (edgelist['t'] <= t_max)
-        )
+        # Early window sanity for TKG mode
+        if not IS_KG:
+            min_lag, max_lag = lag
+            t_min = int(t_curr) - int(max_lag)
+            t_max = int(t_curr) - int(min_lag)
+            if t_max < t_min:
+                _cand_cache[key] = EMPTY_VIEW.iloc[:0]
+                return _cand_cache[key]
+
+        # Try live index first (generation stage)
+        rel_index = None
+        try:
+            rel_index = rel2idx_live.get(int(r))
+        except NameError:
+            rel_index = None
+
+        # If not available (labeling stage), try finalized index
+        if rel_index is None:
+            try:
+                rel_index = rel2idx_local.get(int(r))
+            except NameError:
+                rel_index = None
+
+        if rel_index is not None:
+            if IS_KG:
+                lo, hi = 0, rel_index.t.shape[0]
+            else:
+                min_lag, max_lag = lag
+                t_min = int(t_curr) - int(max_lag)
+                t_max = int(t_curr) - int(min_lag)
+                lo, hi = rel_index.window(t_min, t_max)
+                if lo >= hi:
+                    _cand_cache[key] = EMPTY_VIEW.iloc[:0]
+                    return _cand_cache[key]
+
+            sel = np.ones(hi - lo, dtype=bool)
+            if not _is_ph(h):
+                sel &= (rel_index.head[lo:hi] == int(h))
+            if not _is_ph(ta):
+                sel &= (rel_index.tail[lo:hi] == int(ta))
+            if not np.any(sel):
+                _cand_cache[key] = EMPTY_VIEW.iloc[:0]
+                return _cand_cache[key]
+
+            idxs = rel_index.row_idx[lo:hi][sel]
+            out = edgelist.loc[idxs, ['head', 'rel', 'tail', 't']]
+            _cand_cache[key] = out
+            return out
+
+        # Fallback: Pandas mask (rare once indices exist)
+        if IS_KG:
+            mask = (edgelist['rel'] == r)
+        else:
+            min_lag, max_lag = lag
+            t_min = int(t_curr) - int(max_lag)
+            t_max = int(t_curr) - int(min_lag)
+            mask = (
+                (edgelist['rel'] == r) &
+                (edgelist['t'] >= t_min) &
+                (edgelist['t'] <= t_max)
+            )
         if not _is_ph(h):
-            # Bitwise and for instantiated head
             mask &= (edgelist['head'] == h)
         if not _is_ph(ta):
-            # Bitwise and for instantiated tail
             mask &= (edgelist['tail'] == ta)
-        # Keep only needed columns for speed in iterrows/itertuples
-        cand = edgelist.loc[mask, ['head', 'rel', 'tail', 't']]
-        _cand_cache[key] = cand
-        return cand
-    
+
+        out = edgelist.loc[mask, ['head', 'rel', 'tail', 't']]
+        _cand_cache[key] = out
+        return out
+
     def _match_antecedents_rev(edgelist, ants_rev, lags_rev, t_anchors, mapping):
         """
         Generator backtracking over antecedents in reverse (most recent to oldest).
@@ -641,6 +770,54 @@ def run(config: 'Dict[str,]', run_id: int):
             return []
         return [x]
     
+    def _quad_tuple(h, r, t, ts):
+        # canonical 4-tuple for the collision set
+        return (int(h), int(r), int(t), int(ts))
+    
+    def _reserve_if_free(quads, owner_tag):
+        """
+        Try to reserve a batch of quads. If any collide, do nothing and return False.
+        If all are free, reserve all and return True.
+        """
+        for q in quads:
+            if q in existing_quads:
+                return False
+        for q in quads:
+            existing_quads.add(q)
+            quad_owner[q] = owner_tag
+        return True
+    
+    # global set for *all* existing quads (random wiring, antecedents, consequences)
+    existing_quads = set()
+
+    # simple owner map
+    quad_owner = {}  # (h,r,t,ts) -> 'rand' or f'pid:{pattern_id}'
+
+    def _owner_for(h, r, t, ts):
+        return quad_owner.get(_quad_tuple(h, r, t, ts))
+
+    # per-pattern diagnostics
+    collide_skips = defaultdict(int)
+    collide_tries = defaultdict(list)  # list of #resamples taken for successes
+
+    def _register_df_quads(df, owner_tag):
+        # register a dataframe of edges into the collision set
+        if df is None or df.empty:
+            return
+        for h, r, t, ts in df[['head', 'rel', 'tail', 't']].itertuples(index=False, name=None):
+            q = _quad_tuple(h, r, t, ts)
+            # always track existence
+            if q not in existing_quads:
+                existing_quads.add(q)
+            # DO NOT overwrite a prior reservation (e.g., 'pid:...|bind:...')
+            if q not in quad_owner:
+                quad_owner[q] = owner_tag
+
+    def _would_collide(h, r, t, ts):
+        if not config.get('prevent_quad_collisions', True):
+            return False
+        return _quad_tuple(h, r, t, ts) in existing_quads
+    
     # Get run-specific seed
     if config['seed'] is not None:
         seed = (run_id * 10_000) + config['seed']
@@ -727,9 +904,12 @@ def run(config: 'Dict[str,]', run_id: int):
     pattern2id = create_pattern2id(patterns)
     dbg('pattern2id:', pattern2id)
 
+    rel2idx_live = _RelIndexLive()
+
     # Apply patterns
     edgelist = create_edgelist()
-    pbar_tws = tqdm(range(config['n_tws']))
+    tw_count = 1 if IS_KG else int(config['n_tws'])
+    pbar_tws = tqdm(range(tw_count))
     for t in pbar_tws:
         pbar_tws.set_description(f'Time window: {t}')
 
@@ -768,9 +948,27 @@ def run(config: 'Dict[str,]', run_id: int):
                     't': [t]*dens,
                     'wt': [1]*dens,
                     'pattern': [[-1] for _ in range(dens)],  # -1 indicates a randomly wired edge
+                    'is_antecedent': [0]*dens,
+                    'is_consequence': [0]*dens,
                 })
                 dfs_i.append(df_i)
-        edgelist = pd.concat([edgelist]+dfs_i)
+        if dfs_i:
+            # assign absolute indices before concatenation
+            start = 0 if edgelist.empty else (edgelist.index.max() + 1)
+            reindexed = []
+            cur = start
+            for df_i in dfs_i:
+                n = len(df_i)
+                df_i = df_i.copy()
+                df_i.index = np.arange(cur, cur + n, dtype=np.int64)
+                cur += n
+                reindexed.append(df_i)
+            edgelist = pd.concat([edgelist] + reindexed, ignore_index=False)
+            for df_i in reindexed:
+                rel2idx_live.append_df(df_i)
+            _register_df_quads(pd.concat(reindexed), owner_tag='rand')
+
+
         if edgelist.shape[0] and edgelist['head'].dtype != np.int64:
             edgelist[['head','rel','tail','t']] = edgelist[['head','rel','tail','t']].astype('int64')
 
@@ -804,87 +1002,43 @@ def run(config: 'Dict[str,]', run_id: int):
                     size=1, random_state=rnd_state,
                 )[0])
 
-            # rnd = rnd_state.rand()
-            # if rnd < config['n_hops2p_force'][pattern.n_hops]:
-            #     # Create the antecedent in this and subsequent windows
-            #     # Track time window of current antecedent as we create them
-            #     t_i = int(t)
-            #     # Instantiate pattern based on entity2id weights and wrt placeholders
-            #     instantiated_antecedent = instantiate_antecedent_entities(
-            #         pattern, entity2id, rnd_state,
-            #     )
-            #     heads_pat, rels_pat, tails_pat, ts_pat = [], [], [], []
-            #     for antecedent, time_lag in zip(instantiated_antecedent, pattern.time_lags):
-            #         heads_pat.append(antecedent[0])
-            #         rels_pat.append(antecedent[1])
-            #         tails_pat.append(antecedent[2])
-            #         ts_pat.append(t_i)
-            #         # Increment t_i according to time_lag min and max
-            #         t_i += random.randint(time_lag[0], time_lag[1])
-            #     df_pat = pd.DataFrame({
-            #         'head': heads_pat,
-            #         'rel': rels_pat,
-            #         'tail': tails_pat,
-            #         't': ts_pat,
-            #         'wt': [1]*len(heads_pat),
-            #         'pattern': [[] for _ in range(len(heads_pat))],
-            #     })
-            #     dfs_pat.append(df_pat)
-            
-            #     if rnd_state.rand() < config['p_skip_consequence']:
-            #         # Skip the consequence even though antecedents may be satisfied
-            #         continue
-
-            # TODO Replaced above
             for _ in range(n_instantiations):
-                # Create the antecedent in this and subsequent windows
-                # Track time window of current antecedent as we create them
-                t_i = int(t)
-                # Instantiate pattern based on entity2id weights and wrt placeholders
-                instantiated_antecedent = instantiate_antecedent_entities(
-                    pattern, entity2id, rnd_state,
-                )
-                heads_pat, rels_pat, tails_pat, ts_pat = [], [], [], []
-                for antecedent, time_lag in zip(instantiated_antecedent, pattern.time_lags):
-                    heads_pat.append(antecedent[0])
-                    rels_pat.append(antecedent[1])
-                    tails_pat.append(antecedent[2])
-                    ts_pat.append(t_i)
-                    # Increment t_i according to time_lag min and max
-                    t_i += random.randint(time_lag[0], time_lag[1])
-                df_pat = pd.DataFrame({
-                    'head': heads_pat,
-                    'rel': rels_pat,
-                    'tail': tails_pat,
-                    't': ts_pat,
-                    'wt': [1]*len(heads_pat),
-                    'pattern': [[] for _ in range(len(heads_pat))],
-                })
-                dfs_pat.append(df_pat)
-            
-                if rnd_state.rand() < config['p_skip_consequence']:
-                    # Skip the consequence even though antecedents may be satisfied
-                    continue
+                # Attempt to find a non-colliding binding (entities + timeline)
+                max_resamp = int(config.get('max_instantiation_resamples', 20))
+                tries = 0
+                accepted = False
 
-                # FAST-PATH: emit the consequence now (no backtracking) when there's no random wiring
-                if FAST_FORCE_CONSEQUENCE and NO_RANDOM_WIRING:
-                    # Build placeholder -> entity map from the instantiated antecedents
+                while tries <= max_resamp and not accepted:
+                    tries += 1
+
+                    # Create the antecedent in this and subsequent windows
+                    # Track time window of current antecedent as we create them
+                    t_i = int(t)
+                    # Instantiate pattern based on entity2id weights and wrt placeholders
+                    instantiated_antecedent = instantiate_antecedent_entities(
+                        pattern, entity2id, rnd_state,
+                    )
+                    heads_pat, rels_pat, tails_pat, ts_pat = [], [], [], []
+                    for antecedent, time_lag in zip(instantiated_antecedent, pattern.time_lags):
+                        heads_pat.append(antecedent[0])
+                        rels_pat.append(antecedent[1])
+                        tails_pat.append(antecedent[2])
+                        ts_pat.append(0 if IS_KG else t_i)
+                        # Increment t_i according to time_lag min and max
+                        t_i += random.randint(time_lag[0], time_lag[1])
+
+                    # Resolve consequence for this binding
+                    cons_h, cons_r, cons_ta = pattern.consequence
+                    # Map placeholders if needed
                     ph_map = {}
                     for (tpl, inst) in zip(pattern.antecedent, instantiated_antecedent):
                         ah, ar, at = tpl
                         ih, ir, it = inst
-                        if isinstance(ah, str):
-                            ph_map.setdefault(str(ah), int(ih))
-                        if isinstance(at, str):
-                            ph_map.setdefault(str(at), int(it))
-
-                    cons_h, cons_r, cons_ta = pattern.consequence
-                    cons_time = int(t_i)  # after the last lag, this is the consequence time
-
-                    # Resolve placeholders in the consequence
-                    # If a placeholder wasn't in the antecedents (shouldn't happen given constraints), skip.
+                        if isinstance(ah, str): ph_map.setdefault(str(ah), int(ih))
+                        if isinstance(at, str): ph_map.setdefault(str(at), int(it))
+                    
                     if isinstance(cons_h, str):
-                        if cons_h not in ph_map: 
+                        if cons_h not in ph_map:   # safety
                             continue
                         head_val = int(ph_map[cons_h])
                     else:
@@ -897,23 +1051,71 @@ def run(config: 'Dict[str,]', run_id: int):
                     else:
                         tail_val = int(cons_ta)
 
-                    # Same-placeholder guard: (eK, r, eK) => head must equal tail
+                    # Same-placeholder guard: (eK, r, eK) => force equality
                     if isinstance(cons_h, str) and isinstance(cons_ta, str) and cons_h == cons_ta:
                         tail_val = head_val
 
-                    # Respect p_skip_consequence and horizon
-                    if cons_time < int(config['n_tws']) and rnd_state.rand() >= float(config.get('p_skip_consequence', 0.0)):
-                        heads.append(head_val)
-                        rels.append(int(cons_r))
-                        tails.append(tail_val)
-                        cons_ts.append(cons_time)
-                        pats.append([pattern_id])
+                    cons_time = 0 if IS_KG else int(t_i)
 
-                        # cons_pids.append(pattern_id)
+                    # Build the full quad set for this instantiation (antecedents + consequence)
+                    quads_to_reserve = []
+                    for H, R, T_, TS in zip(heads_pat, rels_pat, tails_pat, ts_pat):
+                        quads_to_reserve.append(_quad_tuple(H, R, T_, TS))
+                    # Consequence
+                    if (not IS_KG) and (cons_time >= int(config['n_tws'])):
+                        # out-of-horizon consequence; reject and resample
+                        continue
+                    quads_to_reserve.append(_quad_tuple(head_val, int(cons_r), tail_val, cons_time))
 
-            # TODO Skip the matcher when the fast path is active
-            # If we emitted consequences via the fast-path, skip the expensive backtracking for this pattern
-            if FAST_FORCE_CONSEQUENCE and NO_RANDOM_WIRING:
+                    # Compute bind_str for this instantiation (deterministic ordering)
+                    placeholders = _pattern_placeholders(pattern.antecedent, pattern.consequence)
+                    bind_str = _binding_to_str(ph_map, placeholders)
+                    owner = f'pid:{pattern_id}|bind:{bind_str}'
+
+                    # If collision prevention is on, atomically reserve all edges for this instantiation.
+                    # Otherwise, accept immediately (old behavior).
+                    if config.get('prevent_quad_collisions', True):
+                        if not _reserve_if_free(quads_to_reserve, owner_tag=owner):
+                            # collision: resample a new binding
+                            if tries > max_resamp:
+                                collide_skips[pattern_id] += 1
+                            continue
+                    # If prevention is off, we don't reserve now and keep old semantics
+
+                    # Emit antecedents
+                    df_pat = pd.DataFrame({
+                        'head': heads_pat,
+                        'rel': rels_pat,
+                        'tail': tails_pat,
+                        't': ts_pat,
+                        'wt': [1]*len(heads_pat),
+                        'pattern': [[] for _ in range(len(heads_pat))],
+                        'is_antecedent': [1]*len(heads_pat),
+                        'is_consequence': [0]*len(heads_pat),
+                    })
+                    dfs_pat.append(df_pat)
+
+                    # Respect p_skip_consequence
+                    if rnd_state.rand() < float(config.get('p_skip_consequence', 0.0)):
+                        accepted = True
+                        # If we reserved the consequence but skip it, we can leave the reservation in place:
+                        # that simply guarantees no one else creates the same consequence later.
+                        continue
+
+                    # Emit consequence (note: time already normalized for KG)
+                    heads.append(int(head_val))
+                    rels.append(int(cons_r))
+                    tails.append(int(tail_val))
+                    cons_ts.append(int(cons_time))
+                    pats.append([pattern_id])
+
+                    accepted = True
+                    if config.get('prevent_quad_collisions', True):
+                        collide_tries[pattern_id].append(tries)
+
+            # Skip the matcher when the fast path is active
+            # If we emitted fast-path consequences, skip expensive backtracking
+            if SKIP_GEN_MATCHER or (FAST_AND_NO_RAND and SKIP_LABEL):
                 continue
 
             # Apply valid patterns
@@ -930,7 +1132,7 @@ def run(config: 'Dict[str,]', run_id: int):
                 edgelist=edgelist,
                 ants_rev=ants_rev,
                 lags_rev=lags_rev,
-                t_anchors=[t],
+                t_anchors=[0] if IS_KG else [t],
                 mapping={}
             ):
                 # Count every binding the matcher yields
@@ -970,6 +1172,15 @@ def run(config: 'Dict[str,]', run_id: int):
     
                 dbg(f"[APPLY] t={t} pid={pattern_id} cons={pattern.consequence} bind={dict(bmap)} -> ({int(head_val)}, {int(cons_r)}, {int(tail_val)})")
 
+                # collision guard for backtracking path
+                if config.get('prevent_quad_collisions', True):
+                    if _would_collide(int(head_val), int(cons_r), int(tail_val), int(t)):
+                        collide_skips[pattern_id] += 1
+                        continue
+                    # reserve immediately to avoid within-TW duplicates
+                    existing_quads.add(_quad_tuple(int(head_val), int(cons_r), int(tail_val), int(t)))
+                    quad_owner[_quad_tuple(int(head_val), int(cons_r), int(tail_val), int(t))] = f'pid:{pattern_id}'
+
                 heads.append(int(head_val))
                 rels.append(int(cons_r))
                 tails.append(int(tail_val))
@@ -979,14 +1190,28 @@ def run(config: 'Dict[str,]', run_id: int):
                 # cons_pids.append(pattern_id)
 
         # Add new forced patterns to edgelist
-        edgelist = pd.concat([edgelist]+dfs_pat)
+        if dfs_pat:
+            start = 0 if edgelist.empty else (edgelist.index.max() + 1)
+            reindexed_pat = []
+            cur = start
+            for df_pat_i in dfs_pat:
+                n = len(df_pat_i)
+                df_pat_i = df_pat_i.copy()
+                df_pat_i.index = np.arange(cur, cur + n, dtype=np.int64)
+                cur += n
+                reindexed_pat.append(df_pat_i)
+            edgelist = pd.concat([edgelist] + reindexed_pat, ignore_index=False)
+            for df_pat_i in reindexed_pat:
+                rel2idx_live.append_df(df_pat_i)
+            _register_df_quads(pd.concat(reindexed_pat), owner_tag='ante')
+
         # Add all new consequences to edgelist
         df_con = pd.DataFrame({
             'head': heads,
             'rel': rels,
             'tail': tails,
-            # 't': [t]*len(heads),
-            't': cons_ts,
+            # 't': cons_ts,
+            't': [0 if IS_KG else cons_ts[i] for i in range(len(heads))],
             'wt': [1]*len(heads),
             'pattern': [[] for _ in range(len(heads))],
             # 'con_pid': cons_pids,
@@ -995,11 +1220,16 @@ def run(config: 'Dict[str,]', run_id: int):
             # windows, making them invalid in the span of time windows we care
             # about. Instead, we label all edges for patterns later.
             # 'pattern': pats,
+            'is_antecedent': [0]*len(heads),
+            'is_consequence': [1]*len(heads),
         })
-        edgelist = pd.concat([
-            edgelist,
-            df_con,
-        ])
+        if not df_con.empty:
+            start = 0 if edgelist.empty else (edgelist.index.max() + 1)
+            df_con = df_con.copy()
+            df_con.index = np.arange(start, start + len(df_con), dtype=np.int64)
+            edgelist = pd.concat([edgelist, df_con], ignore_index=False)
+            rel2idx_live.append_df(df_con)
+            _register_df_quads(df_con, owner_tag='cons')
     
     # Reindex edgelist
     edgelist = edgelist.reset_index(drop=True)
@@ -1009,6 +1239,8 @@ def run(config: 'Dict[str,]', run_id: int):
         dbg(f"[ALIAS] Before unique-ifying: {dup_cnt} rows still share 'pattern' list objects (unexpected).")
 
     edgelist['pattern'] = edgelist['pattern'].apply(_uniq_list_cell)
+    # Build the index once for the finalized edgelist; read-only during labeling
+    rel2idx_local = _build_rel_index_frame(edgelist)
 
     # Optional: quick diagnostic – how many rows still share list objects?
     dup_cnt = edgelist['pattern'].apply(id).duplicated(keep=False).sum()
@@ -1045,23 +1277,44 @@ def run(config: 'Dict[str,]', run_id: int):
             # All placeholders used anywhere in this pattern
             placeholders = _pattern_placeholders(ants, (cons_h, cons_r, cons_ta))
 
-            # Candidate consequence edges by relation and any concrete head/tail
-            mask = (edgelist['rel'] == cons_r)
-            if not _is_ph(cons_h):
-                mask &= (edgelist['head'] == cons_h)
-            if not _is_ph(cons_ta):
-                mask &= (edgelist['tail'] == cons_ta)
+            # Candidate consequence edges by relation and any concrete head/tail (indexed)
+            ridx = rel2idx_local.get(int(cons_r))
+            if ridx is None:
+                # fallback to the original mask (should be rare)
+                mask = (edgelist['rel'] == cons_r)
+                if not _is_ph(cons_h):
+                    mask &= (edgelist['head'] == cons_h)
+                if not _is_ph(cons_ta):
+                    mask &= (edgelist['tail'] == cons_ta)
+                cand_df = edgelist.loc[mask, ['head','tail','t']]
+            else:
+                # start from the view of this relation only
+                cand_df = edgelist.iloc[ridx.row_idx][['head','tail','t']]
+                if not _is_ph(cons_h):
+                    cand_df = cand_df[cand_df['head'] == int(cons_h)]
+                if not _is_ph(cons_ta):
+                    cand_df = cand_df[cand_df['tail'] == int(cons_ta)]
 
             same_ph_cons = (_is_ph(cons_h) and _is_ph(cons_ta) and cons_h == cons_ta)
-
-            cand_df = edgelist.loc[mask, ['head', 'tail', 't']]
             if same_ph_cons:
                 cand_df = cand_df[cand_df['head'] == cand_df['tail']]
 
             # Group by exact consequence triple+time; do the search once per distinct group
             for (h_val, ta_val, t_anchor), group_index in cand_df.groupby(['head','tail','t'], sort=False).groups.items():
+                anchor = 0 if IS_KG else int(t_anchor)
                 idxs = list(group_index)   # all row indices with this exact (h, r, t, tail)
 
+                # If collision prevention is on: only the owning (pid, bind) is allowed to label this edge.
+                reserved_bind = None
+                if config.get('prevent_quad_collisions', True):
+                    owner_here = _owner_for(int(h_val), int(cons_r), int(ta_val), int(t_anchor))
+                    # Only proceed if this consequence edge is owned by this pattern
+                    if not owner_here or not owner_here.startswith(f'pid:{pattern_id}'):
+                        continue
+                    # If the owner encodes a bind, extract it; otherwise leave as None (legacy)
+                    if '|bind:' in owner_here:
+                        reserved_bind = owner_here.split('|bind:', 1)[1]
+                
                 # Seed placeholders from the consequence itself
                 init_map = {}
                 if same_ph_cons:
@@ -1090,7 +1343,7 @@ def run(config: 'Dict[str,]', run_id: int):
                 # Run the backtracker ONCE for this (h_val, ta_val, t_anchor)
                 for mapping, path in _match_antecedents_rev_with_paths(
                     edgelist=edgelist, ants=ants, lags=lags,
-                    t_anchors=[int(t_anchor)], step=0, mapping=init_map, path=[],
+                    t_anchors=[anchor], step=0, mapping=init_map, path=[],
                 ):
                     # Guard: mapping must reproduce this consequence (should pass now that we seeded)
                     exp_h = mapping[cons_h] if _is_ph(cons_h) else cons_h
@@ -1103,12 +1356,26 @@ def run(config: 'Dict[str,]', run_id: int):
                         continue
 
                     bind_str = _binding_to_str(mapping, placeholders)
+                    # If collision prevention is on and we have a reserved bind, only that bind may label this consequence.
+                    if config.get('prevent_quad_collisions', True) and (reserved_bind is not None) and (bind_str != reserved_bind):
+                        continue
 
                     # Label antecedents used by this instantiation
                     for ante_idx, edge_idx in path:
                         # Never tag the same row as both consequence and antecedent
                         if edge_idx in idxs:
                             continue
+
+                        # If collision prevention is on: only antecedent edges owned by the SAME (pid, bind) get labeled
+                        if config.get('prevent_quad_collisions', True) and (reserved_bind is not None):
+                            qh = int(edgelist.at[edge_idx, 'head'])
+                            qr = int(edgelist.at[edge_idx, 'rel'])
+                            qt = int(edgelist.at[edge_idx, 'tail'])
+                            qts = int(edgelist.at[edge_idx, 't'])
+                            a_owner = _owner_for(qh, qr, qt, qts)
+                            if a_owner != f'pid:{pattern_id}|bind:{reserved_bind}':
+                                continue
+                        
                         ant = ants[ante_idx]
                         ah = mapping[_norm_ph(ant[0])] if _is_ph(_norm_ph(ant[0])) else _norm_ph(ant[0])
                         ar = ant[1]
@@ -1152,6 +1419,8 @@ def run(config: 'Dict[str,]', run_id: int):
     edgelist = edgelist.groupby(['head', 'rel', 'tail', 't']).agg({
         'wt': 'sum',
         'pattern': _flatten_labels,
+        'is_antecedent': 'max',
+        'is_consequence': 'max',
     }).reset_index().sort_values(['t', 'head', 'tail', 'rel']).reset_index(drop=True)
 
     # Deduplicate per-edge patterns id list
@@ -1189,21 +1458,67 @@ def run(config: 'Dict[str,]', run_id: int):
             "the graph is empty. Increase n_force/p_force and/or pattern counts."
         )
 
-    # Temporal Train-Valid-Test split
-    timestamps_unq = pd.Series(edgelist['t'].unique())
-    end_train, end_valid, end_test = \
-        int(timestamps_unq.quantile(config['split'][0])), \
-        int(timestamps_unq.quantile(config['split'][0] + config['split'][1])), \
-        int(timestamps_unq.max())
-    if (end_train == end_valid) and (config['split'][1] != 0):
-        # Allow user to specify 0% validation set
-        raise ValueError(f'Split into train and valid sets failed because of quantile collision: {end_train}')
-    if (end_valid == end_test) and (config['split'][2] != 0):
-        # Allow user to specify 0% test set
-        raise ValueError(f'Split into valid and test sets failed because of quantile collision: {end_valid}')
-    train_df = edgelist[edgelist['t'] <= end_train]
-    valid_df = edgelist[(edgelist['t'] > end_train) & (edgelist['t'] <= end_valid)]
-    test_df = edgelist[edgelist['t'] > end_valid]
+    # Splitting
+    if not IS_KG:
+        # Temporal Train-Valid-Test split
+        timestamps_unq = pd.Series(edgelist['t'].unique())
+        end_train, end_valid, end_test = \
+            int(timestamps_unq.quantile(config['split'][0])), \
+            int(timestamps_unq.quantile(config['split'][0] + config['split'][1])), \
+            int(timestamps_unq.max())
+        if (end_train == end_valid) and (config['split'][1] != 0):
+            # Allow user to specify 0% validation set
+            raise ValueError(f'Split into train and valid sets failed because of quantile collision: {end_train}')
+        if (end_valid == end_test) and (config['split'][2] != 0):
+            # Allow user to specify 0% test set
+            raise ValueError(f'Split into valid and test sets failed because of quantile collision: {end_valid}')
+        train_df = edgelist[edgelist['t'] <= end_train]
+        valid_df = edgelist[(edgelist['t'] > end_train) & (edgelist['t'] <= end_valid)]
+        test_df = edgelist[edgelist['t'] > end_valid]
+    else:
+        # KG split by random sampling
+        val_frac  = float(config['split'][1])
+        test_frac = float(config['split'][2])
+
+        # Build the eligible pool: pure consequences that are not antecedents (consequence_only) or all edges (all)
+        df = edgelist.copy()
+        if config.get('split_on', 'consequence_only') == 'all':
+            # Randomly split all edges
+            eligible = df.index.values
+        else:
+            # Split only "pure" consequences (never antecedents), keep antecedents in train
+            eligible = df.index[(df['is_consequence'] == 1) & (df['is_antecedent'] == 0)].values
+
+        # Everything starts as train.
+        tags = np.full(len(df), 'train', dtype=object)
+
+        # Deterministic RNG tied to this run
+        # (same construction as above for repeatability)
+        seed_split = (run_id * 10_000) + (config['seed'] or 0)
+        rng = np.random.RandomState(seed_split)
+
+        n = len(eligible)
+        n_test = int(round(n * test_frac))
+        n_val  = int(round(n * val_frac))
+        # Ensure we don't overshoot
+        n_test = min(n_test, n)
+        n_val  = min(n_val, max(0, n - n_test))
+
+        shuf = rng.permutation(eligible)
+        test_idx = set(shuf[:n_test].tolist())
+        val_idx  = set(shuf[n_test:n_test+n_val].tolist())
+
+        # Assign only for the chosen consequence rows.
+        for i in val_idx:
+            tags[i] = 'valid'
+        for i in test_idx:
+            tags[i] = 'test'
+
+        # NOTE: rows with is_antecedent==1 remain 'train' by construction.
+        train_df = df[tags == 'train']
+        valid_df = df[tags == 'valid']
+        test_df  = df[tags == 'test']
+        
     cols_export = [
         'head', 
         'rel',
@@ -1218,7 +1533,7 @@ def run(config: 'Dict[str,]', run_id: int):
         os.path.join(export_dir, 'valid.txt'), sep='\t', index=False, header=False)
     test_df[cols_export].to_csv(
         os.path.join(export_dir, 'test.txt'), sep='\t', index=False, header=False)
-    
+        
     # Write config to export directory, for reproducibility
     dump_config_snapshot(export_dir, config)
 
@@ -1230,6 +1545,19 @@ def run(config: 'Dict[str,]', run_id: int):
     # Top 15 by unique count
     dbg("\n=== Pattern instantiation summary (this run) ===")
     dbg(summary.sort_values('instantiated_bindings_unique', ascending=False).head(15).to_string(index=False))
+
+    if config.get('prevent_quad_collisions', True):
+        # summarize collision stats
+        totals = sum(collide_skips.values())
+        if totals:
+            dbg("\n=== Collision summary (skipped consequence emissions) ===")
+            top = sorted(collide_skips.items(), key=lambda kv: kv[1], reverse=True)[:int(config.get('collision_log_top', 10))]
+            for pid, cnt in top:
+                tries = collide_tries.get(pid, [])
+                msg = f"pid={pid} skipped={cnt}"
+                if tries:
+                    msg += f" | avg_tries={np.mean(tries):.2f} p95={np.percentile(tries,95):.1f}"
+                dbg(msg)
 
     # Also write the full table to disk
     export_dir = os.path.join(config['export_dir'], f'run_{run_id}')

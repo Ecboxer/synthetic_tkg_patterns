@@ -1,0 +1,101 @@
+{
+  "export_dir": "opt_runs_icews14_20251022/trial_367",
+  "seed": 367,
+  "debug": false,
+  "skip_labeling": true,
+  "split": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "fast_force_consequence": true,
+  "n_runs": 1,
+  "n_jobs": 1,
+  "n_ents": 7128,
+  "n_rels": 230,
+  "n_tws": 365,
+  "pat_distr_ents": {
+    "__callable__": "sampler",
+    "repr": "def sampler(n: int, seed=None):\n        rng = _rng_from_seed(seed)\n        ranks = np.arange(1, int(n) + 1, dtype=float)\n        w = 1.0 / np.power(ranks + q, s)\n        # tiny jitter for ties\n        w = w / w.sum()\n        # Return weights, not a categorical sample\n        # shuffle to avoid perfect correlation with id order\n        rng.shuffle(w)\n        return w"
+  },
+  "pat_distr_rels": {
+    "__callable__": "sampler",
+    "repr": "def sampler(n: int, seed=None):\n        rng = _rng_from_seed(seed)\n        w = rng.pareto(alpha, size=int(n)) + 1.0\n        w = w * xm\n        if cap is not None:\n            w = np.minimum(w, cap)\n        return w"
+  },
+  "require_unique_triples": true,
+  "prohibit_selfconnections": false,
+  "prohibit_new_consequence_relations": false,
+  "require_sequential_rule": false,
+  "prevent_quad_collisions": true,
+  "max_instantiation_resamples": 20,
+  "n_3_hop": 93,
+  "time_lag_3_hop": [
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ]
+  ],
+  "n_2_hop": 57,
+  "time_lag_2_hop": [
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ]
+  ],
+  "n_1_hop": 303,
+  "time_lag_1_hop": [
+    [
+      1,
+      {
+        "__callable__": "<lambda>",
+        "repr": "(1, lambda seed: __import__(\"scipy\").stats.poisson(5).rvs(1, random_state=seed)[0]),"
+      }
+    ]
+  ],
+  "max_retries": 3,
+  "rnd_avg_density": 0.0,
+  "rnd_avg_density_distr": null,
+  "p_skip_consequence": 0.0,
+  "n_hops2p_force": {
+    "1": 0.1,
+    "2": 0.1,
+    "3": 0.1
+  },
+  "n_hops2n_force": {
+    "1": 2,
+    "2": 2,
+    "3": 2
+  },
+  "n_hops2n_force_distr": {
+    "1": null,
+    "2": null,
+    "3": null
+  }
+}
