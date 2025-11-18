@@ -1,9 +1,13 @@
 import argparse
+import ast
 import json
 import os
 import shutil
 import sys
+
+from collections import defaultdict
 from copy import deepcopy
+from typing import Callable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,6 +50,64 @@ GAMMA_OPTIONS = {
     "gamma(0.5,1.0)": (0.5, 1.0),
 }
 
+COLS_PUBLIC = ["head","rel","tail","t","wt","pattern"]
+COLS_META = COLS_PUBLIC + ["is_antecedent","is_consequence"]
+
+LagSpec = List[Tuple[int, Callable]]
+
+
+def _normalize_pattern_col(series: pd.Series) -> list:
+    out = []
+    for cell in series:
+        if isinstance(cell, list):
+            out.append(cell)
+        elif pd.isna(cell) or cell == "" or cell == "[]":
+            out.append([])
+        else:
+            try:
+                v = ast.literal_eval(str(cell))
+                out.append(list(v) if isinstance(v, (list, tuple)) else [str(v)])
+            except Exception:
+                out.append([str(cell)])
+    return out
+
+def _read_split_any(run_dir: str, split: str) -> pd.DataFrame:
+    """ Read edgelist files.
+    Prefer <split>.meta.tsv (headered, includes flags). Fallback to <split>.txt (no flags).
+    Returns a DataFrame with at least: head, rel, tail, t, wt, pattern, is_antecedent, is_consequence
+    """
+    p_meta = os.path.join(run_dir, f"{split}.meta.tsv")
+    p_pub  = os.path.join(run_dir, f"{split}.txt")
+
+    if os.path.exists(p_meta):
+        df = pd.read_csv(p_meta, sep="\t") #, engine="python")
+        # Ensure dtypes
+        for c in ["head","rel","tail","t","is_antecedent","is_consequence"]:
+            df[c] = pd.to_numeric(df[c], errors="raise", downcast="integer")
+        # pattern: allow lists/strings
+        if "pattern" in df.columns:
+            df["pattern"] = _normalize_pattern_col(df["pattern"])
+        else:
+            df["pattern"] = [[]]*len(df)
+        # wt
+        if "wt" not in df.columns:
+            df["wt"] = 1
+        return df[COLS_META]
+
+    # Fallback: public TSV (no header, no flags)
+    df = pd.read_csv(p_pub, sep="\t", header=None, names=COLS_PUBLIC) #, engine="python")
+    for c in ["head","rel","tail","t"]:
+        df[c] = pd.to_numeric(df[c], errors="raise", downcast="integer")
+    if "pattern" in df.columns:
+        df["pattern"] = _normalize_pattern_col(df["pattern"])
+    else:
+        df["pattern"] = [[]]*len(df)
+    df["wt"] = df.get("wt", 1)
+    # synthesize flags: we don't know; assume not antecedent, not consequence
+    df["is_antecedent"] = 0
+    df["is_consequence"] = 0
+    return df[COLS_META]
+
 def _empty_metrics():
     return {
         "n_ents": 0, "n_rels": 0, "n_tws": 0, "n_quads": 0,
@@ -60,7 +122,7 @@ def _read_edgelist_any(path: str) -> pd.DataFrame:
     - Returns standardized columns: head, rel, tail, t (ints).
     - Ignores extra columns (pattern/weights/whatever).
     """
-    df = pd.read_csv(path, sep="\t", header=None, dtype=str, engine="python")
+    df = pd.read_csv(path, sep="\t", header=None, dtype=str) #, engine="python")
     if df.shape[1] < 4:
         raise ValueError(f"File {path} must have at least 4 tab-separated columns.")
 
@@ -91,6 +153,17 @@ def load_tkg_dir(edgelist_dir: str) -> pd.DataFrame:
     for c in ["head", "rel", "tail", "t"]:
         df[c] = df[c].astype(np.int64)
     return df
+
+
+def _load_json_arg(val: str):
+    """If val is empty -> None. If it is a path to a file -> json.load(file). Otherwise -> json.loads(val)."""
+    val = (val or "").strip()
+    if not val:
+        return None
+    if os.path.exists(val):
+        with open(val, "r") as f:
+            return json.load(f)
+    return json.loads(val)
 
 
 def compute_metrics(df: pd.DataFrame) -> dict:
@@ -211,6 +284,7 @@ def make_config_from_trial(
     cfg['prohibit_new_consequence_relations'] = bool(trial_params['prohibit_new_consequence_relations'])
     cfg['require_sequential_rule'] = bool(trial_params['require_sequential_rule'])
     cfg['prevent_quad_collisions'] = bool(trial_params['prevent_quad_collisions'])
+    cfg['prevent_triple_collisions'] = bool(trial_params['prevent_triple_collisions'])
 
     # Pass resolved samplers (or None for uniform)
     cfg['pat_distr_ents'] = trial_params.get('_pat_distr_ents_fn', None)
@@ -436,6 +510,84 @@ def build_choice_to_sampler(ref_tkg_dir: str):
     return choice_to_sampler
 
 
+def build_choice_to_sampler_no_ref():
+    """
+    For synthetic-only experiments with no reference TKG: support 'uniform' + parametric samplers.
+    """
+    MENU = {
+        **{name: (lambda sh=sc[0], sca=sc[1]: make_gamma_weight_sampler(sh, sca))
+           for name, sc in GAMMA_OPTIONS.items()},
+        "zipf(s=1.2,q=1.0)": (lambda: make_zipf_weight_sampler(1.2, 1.0)),
+        "zipf(s=1.4,q=1.0)": (lambda: make_zipf_weight_sampler(1.4, 1.0)),
+        "zipf(s=1.7,q=0.5)": (lambda: make_zipf_weight_sampler(1.7, 0.5)),
+        "pareto(a=1.3,xm=1.0)": (lambda: make_pareto_weight_sampler(1.3, 1.0)),
+        "pareto(a=1.6,xm=1.0)": (lambda: make_pareto_weight_sampler(1.6, 1.0)),
+        "lognorm(mu=0,s=1.0)": (lambda: make_lognorm_weight_sampler(0.0, 1.0)),
+        "lognorm(mu=0,s=1.4)": (lambda: make_lognorm_weight_sampler(0.0, 1.4)),
+        "negbin(r=1.2,p=0.35)": (lambda: make_negbin_weight_sampler(1.2, 0.35)),
+        "negbin(r=2.0,p=0.25)": (lambda: make_negbin_weight_sampler(2.0, 0.25)),
+    }
+    def choice_to_sampler(choice: str, which: str):
+        if choice == "uniform":
+            return None
+        if choice in MENU:
+            return MENU[choice]()
+        raise ValueError(f"Unknown distribution choice (no-ref mode): {choice}")
+    return choice_to_sampler
+
+
+# Time lag helpers
+def _poisson_sampler(lam):
+    import scipy.stats as st
+    return lambda seed=None: int(st.poisson(mu=float(lam)).rvs(1, random_state=seed)[0])
+
+def _uniform_sampler(lo, hi_inclusive):
+    lo = int(lo); hi = int(hi_inclusive)
+    def f(seed=None):
+        rng = _rng_from_seed(seed)
+        # randint high is exclusive; add 1
+        return int(rng.randint(lo, hi + 1))
+    return f
+
+def _clip_sampler(base_sampler, lo, hi):
+    lo = int(lo); hi = int(hi)
+    return lambda seed=None: int(max(lo, min(hi, int(base_sampler(seed)))))
+
+def _repeat_lag(sampler, k=3):
+    """
+    Helper: make a 3-entry lag spec [ (1,sampler), (1,sampler), (1,sampler) ].
+    1-hop will use first, 2-hop first two, 3-hop all three.
+    """
+    return [(1, sampler) for _ in range(k)]
+
+# For 1-hop use first entry; for 2-hop use first two; for 3-hop use all three.
+LAG_PROFILE_MENU = {
+    # Very tight recency: 1–3 steps back
+    "u1_3": _repeat_lag(_uniform_sampler(1, 3)),
+
+    # Short lags: 1–5 steps
+    "u1_5": _repeat_lag(_uniform_sampler(1, 5)),
+
+    # Moderately short: 1–8 steps
+    "u1_8": _repeat_lag(_uniform_sampler(1, 8)),
+
+    # Wider but still reasonable: 1-11 steps
+    "u1_11": _repeat_lag(_uniform_sampler(1, 11)),
+
+    # Poisson-ish, clipped to 1–5 (slightly more mass near small lags)
+    "poi3_5": _repeat_lag(_clip_sampler(_poisson_sampler(3), 1, 5)),
+
+    # Poisson-ish, clipped to 1–10 (slightly more mass near small lags)
+    "poi3_10": _repeat_lag(_clip_sampler(_poisson_sampler(3), 1, 10)),
+}
+
+def build_time_lag_list(k_hops: int, profile_name: str):
+    tpl = LAG_PROFILE_MENU[profile_name]
+    if k_hops < 1 or k_hops > 3:
+        raise ValueError(f"k_hops must be 1..3, got {k_hops}")
+    return tpl[:k_hops]
+
+
 # Distribution + error helpers
 def compute_distributions(df: pd.DataFrame) -> dict:
     """
@@ -614,7 +766,7 @@ def _mk_query_index(df_all: pd.DataFrame):
     df_all = df_all.sort_values(["t"]).reset_index(drop=True)
     hist = {}
     for h, r, t, tail in df_all[["head","rel","t","tail"]].itertuples(index=False, name=None):
-        hist.setdefault((h, r), []).append((int(t), int(tail)))
+        hist.setdefault((int(h), int(r)), []).append((int(t), int(tail)))
     return hist
 
 def _iter_test_queries(test_df: pd.DataFrame, max_q: int):
@@ -634,15 +786,14 @@ def _hits_at_k_from_ranklist(true_tail: int, rank_list: list[int], Ks: list[int]
 def _recency_ranklist(hist_list: list[tuple[int,int]], t: int) -> list[int]:
     """Return unique tails ranked by most recent occurrence before t."""
     # walk backwards and collect first-seen tails
-    seen = set()
-    ranked = []
+    seen, ranked = set(), []
     for t_i, tail in reversed(hist_list):
         if t_i >= t:
             continue
         if tail not in seen:
             seen.add(tail)
             ranked.append(tail)
-    return ranked  # already most-recent-first
+    return ranked
 
 def _frequency_ranklist(hist_list: list[tuple[int,int]], t: int, history_len: int) -> list[int]:
     """Look back to last `history_len` occurrences before t; rank by frequency desc, tiebreak by recency."""
@@ -656,10 +807,9 @@ def _frequency_ranklist(hist_list: list[tuple[int,int]], t: int, history_len: in
     if not window:
         return []
     # counts + most recent tiebreaker
-    freq = {}
-    last_t = {}
+    freq, last_t = defaultdict(int), {}
     for t_i, tail in window:
-        freq[tail] = freq.get(tail, 0) + 1
+        freq[tail] += 1
         last_t[tail] = max(last_t.get(tail, -10**18), t_i)
     # sort by (-count, -last_t)
     ranked = sorted(freq.keys(), key=lambda x: (-freq[x], -last_t[x]))
@@ -718,6 +868,65 @@ def evaluate_baselines(
             out[f"frequency(h={H})@{k}"] = acc_freq[(H, k)] / denom
     return out
 
+def evaluate_baselines_consequence_only(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    test_df:  pd.DataFrame,
+    *,
+    recency_k_list=(1,3,5,10),
+    frequency_k_list=(1,3,5,10),
+    history_len_list=(3,10),
+    max_queries: int = None
+) -> dict:
+    """
+    Evaluate baselines **only on test consequences** (rows with is_consequence==1),
+    using history from **all edges in train+valid+test** but strictly before t*.
+    """
+    # Build history from all edges
+    history_df = pd.concat([train_df, valid_df, test_df], ignore_index=True)
+    hist = _mk_query_index(history_df)
+
+    # Select test consequence queries
+    qdf = test_df.loc[(test_df["is_consequence"] == 1), ["head","rel","t","tail"]].copy()
+    if qdf.empty:
+        # Defensive fallback: evaluate on all test if flags missing
+        qdf = test_df[["head","rel","t","tail"]].copy()
+    
+    # Cap on number of queries
+    if max_queries is not None and max_queries < len(qdf):
+        qdf = qdf.sample(max_queries, random_state=0)
+
+    # Accumulate H@K
+    n = 0
+    acc_rec = {k: 0.0 for k in recency_k_list}
+    acc_freq = {(H, k): 0.0 for H in history_len_list for k in frequency_k_list}
+
+    for h, r, t_star, true_tail in qdf.itertuples(index=False, name=None):
+        lst = hist.get((int(h), int(r)))
+        if not lst:
+            continue
+        n += 1
+
+        # recency
+        rlist = _recency_ranklist(lst, int(t_star))
+        pos = {a:i for i,a in enumerate(rlist)}
+        for k in recency_k_list:
+            acc_rec[k] += 1.0 if (int(true_tail) in pos and pos[int(true_tail)] < k) else 0.0
+
+        # frequency
+        for H in history_len_list:
+            flist = _frequency_ranklist(lst, int(t_star), H)
+            p2 = {a:i for i,a in enumerate(flist)}
+            for k in frequency_k_list:
+                acc_freq[(H,k)] += 1.0 if (int(true_tail) in p2 and p2[int(true_tail)] < k) else 0.0
+
+    denom = max(n, 1)
+    out = {f"recency@{k}": acc_rec[k] / denom for k in recency_k_list}
+    for H in history_len_list:
+        for k in frequency_k_list:
+            out[f"frequency(h={H})@{k}"] = acc_freq[(H, k)] / denom
+    return out
+
 def score_baseline_similarity(syn_b: dict, ref_b: dict) -> float:
     """
     Average absolute difference across common baseline keys.
@@ -750,8 +959,7 @@ def extract_synthetic_metrics_from_dir(run_dir: str) -> dict:
 
 
 def objective_factory(
-    base_config: dict, 
-    ref_tkg_dir: str,
+    base_config: dict,
     export_dir: str,
     metric_weights: dict,
     *,
@@ -761,67 +969,124 @@ def objective_factory(
     baseline_weight: float,
     baseline_max_queries_ref: int,
     baseline_max_queries_syn: int,
+    ref_tkg_dir: str = None,
+    target_metrics: dict = None,
+    target_baselines: dict = None,
+    n1_range=None,
+    n2_range=None,
+    n3_range=None,
+    p_force_range=None,
+    n_force_range=None,
+    pat_ents_choices_cli=None,
+    pat_rels_choices_cli=None,
 ):
-    target = prepare_target_metrics(ref_tkg_dir)
+    # Target metrics
+    if target_metrics is not None:
+        target = dict(target_metrics)
+    else:
+        if ref_tkg_dir is None:
+            raise ValueError("objective_factory: need either ref_tkg_dir or target_metrics.")
+        target = prepare_target_metrics(ref_tkg_dir)
 
-    # Precompute empirical samplers
-    ref_tkg_df = load_tkg_dir(ref_tkg_dir)
-    # _emp_ent_probs = _empirical_probs_entities(ref_tkg_df)
-    # _emp_rel_probs = _empirical_probs_relations(ref_tkg_df)
-    # _emp_ent_sampler = make_empirical_weight_sampler(_emp_ent_probs)
-    # _emp_rel_sampler = make_empirical_weight_sampler(_emp_rel_probs)
+    # Target distributions
+    if ref_tkg_dir is not None:
+        ref_tkg_df = load_tkg_dir(ref_tkg_dir)
+        tgt_dists = compute_distributions(ref_tkg_df)
+    else:
+        tgt_dists = None  # distributions are optional
 
-    # Compute target distributions and sizes at the study root
-    target_distributions = compute_distributions(ref_tkg_df)
     REF_COUNTS = {
         "n_ents": int(target["n_ents"]),
         "n_rels": int(target["n_rels"]),
         "n_tws":  int(target["n_tws"]),
     }
 
-    # Persistent target artifacts
+    # Persist target artifacts to export_root (if available)
     root_target_metrics = os.path.join(export_dir, "target_metrics.json")
-    root_target_dists   = os.path.join(export_dir, "target_distributions.json")
     if not os.path.exists(root_target_metrics):
         with open(root_target_metrics, "w") as f:
             json.dump(target, f, indent=2)
-    if not os.path.exists(root_target_dists):
+    root_target_dists = os.path.join(export_dir, "target_distributions.json")
+    if tgt_dists is not None and not os.path.exists(root_target_dists):
         with open(root_target_dists, "w") as f:
-            json.dump(target_distributions, f, indent=2)
+            json.dump(tgt_dists, f, indent=2)
 
     # Reference TKG baseline performance
-    ref_train = _read_edgelist_any(os.path.join(ref_tkg_dir, "train.txt"))
-    ref_valid = _read_edgelist_any(os.path.join(ref_tkg_dir, "valid.txt"))
-    ref_test  = _read_edgelist_any(os.path.join(ref_tkg_dir, "test.txt"))
+    if baseline_weight > 0:
+        if target_baselines is not None:
+            target_baselines_local = dict(target_baselines)
+        elif ref_tkg_dir is not None:
+            # compute from reference TKG
+            ref_train = _read_edgelist_any(os.path.join(ref_tkg_dir, "train.txt"))
+            ref_valid = _read_edgelist_any(os.path.join(ref_tkg_dir, "valid.txt"))
+            ref_test = _read_edgelist_any(os.path.join(ref_tkg_dir, "test.txt"))
 
-    ref_baseline_path = os.path.join(export_dir, "target_baselines.json")
-    if os.path.exists(ref_baseline_path):
-        with open(ref_baseline_path, "r") as f:
-            target_baselines = json.load(f)
+            ref_baseline_path = os.path.join(export_dir, "target_baselines.json")
+            if os.path.exists(ref_baseline_path):
+                with open(ref_baseline_path, "r") as f:
+                    target_baselines_local = json.load(f)
+            else:
+                target_baselines_local = evaluate_baselines(
+                    train_df=ref_train, valid_df=ref_valid, test_df=ref_test,
+                    recency_k_list=recency_k_list,
+                    frequency_k_list=frequency_k_list,
+                    history_len_list=history_len_list,
+                    max_queries=baseline_max_queries_ref,
+                )
+                with open(ref_baseline_path, "w") as f:
+                    json.dump(target_baselines_local, f, indent=2)
+        else:
+            # No way to define baseline similarity; silently disable it
+            print("[objective_factory] baseline_weight>0 but no ref_tkg_dir/target_baselines; disabling baseline term.", file=sys.stderr)
+            baseline_weight = 0.0
+            target_baselines_local = {}
     else:
-        target_baselines = evaluate_baselines(
-            train_df=ref_train, valid_df=ref_valid, test_df=ref_test,
-            recency_k_list=recency_k_list,
-            frequency_k_list=frequency_k_list,
-            history_len_list=history_len_list,
-            max_queries=baseline_max_queries_ref,
-        )
-        with open(ref_baseline_path, "w") as f:
-            json.dump(target_baselines, f, indent=2)
+        target_baselines_local = {}
     
     # Define choices & mapping for pat_distr_*
-    choice_to_sampler = build_choice_to_sampler(ref_tkg_dir)
-    distr_choices = (
-        ["uniform", "empirical"]
-        + list(GAMMA_OPTIONS.keys())
-        + [
-            "zipf(s=1.2,q=1.0)", "zipf(s=1.4,q=1.0)", "zipf(s=1.7,q=0.5)",
-            "pareto(a=1.3,xm=1.0)", "pareto(a=1.6,xm=1.0)",
-            "lognorm(mu=0,s=1.0)", "lognorm(mu=0,s=1.4)",
-            "negbin(r=1.2,p=0.35)", "negbin(r=2.0,p=0.25)",
-        ]
-    )
+    if ref_tkg_dir is not None:
+        choice_to_sampler = build_choice_to_sampler(ref_tkg_dir)
+        distr_choices = (
+            ["empirical", "uniform"]
+            + list(GAMMA_OPTIONS.keys())
+            + [
+                "zipf(s=1.2,q=1.0)", "zipf(s=1.4,q=1.0)", "zipf(s=1.7,q=0.5)",
+                "pareto(a=1.3,xm=1.0)", "pareto(a=1.6,xm=1.0)",
+                "lognorm(mu=0,s=1.0)", "lognorm(mu=0,s=1.4)",
+                "negbin(r=1.2,p=0.35)", "negbin(r=2.0,p=0.25)",
+            ]
+        )
+        distr_choices_ent = distr_choices  # same menu for entities
+    else:
+        # No "empirical" option
+        choice_to_sampler = build_choice_to_sampler_no_ref()
+        distr_choices = (
+            ["uniform"]
+            + list(GAMMA_OPTIONS.keys())
+            + [
+                "zipf(s=1.2,q=1.0)", "zipf(s=1.4,q=1.0)", "zipf(s=1.7,q=0.5)",
+                "pareto(a=1.3,xm=1.0)", "pareto(a=1.6,xm=1.0)",
+                "lognorm(mu=0,s=1.0)", "lognorm(mu=0,s=1.4)",
+                "negbin(r=1.2,p=0.35)", "negbin(r=2.0,p=0.25)",
+            ]
+        )
+        distr_choices_ent = distr_choices
     
+    def _filter_menu(base, allowed):
+        if not allowed:
+            return base
+        allowed = set(allowed)
+        out = [x for x in base if x in allowed]
+        if not out:
+            raise ValueError(f"No overlap between requested pat_distr_* choices {allowed} and base menu {base}")
+        return out
+
+    distr_choices_ent = _filter_menu(distr_choices_ent, pat_ents_choices_cli)
+    distr_choices = _filter_menu(
+        distr_choices,
+        (pat_rels_choices_cli or pat_ents_choices_cli)
+    )
+
     def objective_optuna(trial):
         # Suggest params
         params = {}
@@ -833,7 +1098,7 @@ def objective_factory(
         params['n_tws']  = REF_COUNTS['n_tws']
 
         # Choose pat_distr_* options
-        e_choice = trial.suggest_categorical("pat_distr_ents", distr_choices)
+        e_choice = trial.suggest_categorical("pat_distr_ents", distr_choices_ent)
         r_choice = trial.suggest_categorical("pat_distr_rels", distr_choices)
         # params['_pat_distr_ents_fn'] = _choice_to_sampler(e_choice, "ents")
         # params['_pat_distr_rels_fn'] = _choice_to_sampler(r_choice, "rels")
@@ -844,22 +1109,31 @@ def objective_factory(
         params['_pat_distr_rels_choice'] = r_choice
 
         # Pattern counts
-        params['n_1_hop'] = trial.suggest_int("n_1_hop", 15, 400)
-        params['n_2_hop'] = trial.suggest_int("n_2_hop", 10, 300)
-        params['n_3_hop'] = trial.suggest_int("n_3_hop", 5, 200)
+        if n1_range is not None:
+            lo, hi, step = n1_range
+            params['n_1_hop'] = trial.suggest_int("n_1_hop", lo, hi, step=step)
+        else:
+            params['n_1_hop'] = trial.suggest_int("n_1_hop", 25, 350, step=25)
+
+        if n2_range is not None:
+            lo, hi, step = n2_range
+            params['n_2_hop'] = trial.suggest_int("n_2_hop", lo, hi, step=step)
+        else:
+            params['n_2_hop'] = trial.suggest_int("n_2_hop", 25, 250, step=25)
+
+        if n3_range is not None:
+            lo, hi, step = n3_range
+            params['n_3_hop'] = trial.suggest_int("n_3_hop", lo, hi, step=step)
+        else:
+            params['n_3_hop'] = trial.suggest_int("n_3_hop", 25, 200, step=25)
 
         # Booleans pattern hyperparameters
         params['require_unique_triples'] = True  # EB: Fix to True
-        params['prohibit_selfconnections'] = trial.suggest_categorical(
-            "prohibit_selfconnections", [False, True]
-        )
-        params['prohibit_new_consequence_relations'] = trial.suggest_categorical(
-            "prohibit_new_consequence_relations", [False, True]
-        )
-        params['require_sequential_rule'] = trial.suggest_categorical(
-            "require_sequential_rule", [False, True]
-        )
+        params['prohibit_selfconnections'] = False  # EB: Fix to False
+        params['prohibit_new_consequence_relations'] = False  # EB: Fix to False
+        params['require_sequential_rule'] = False  # EB: Fix to False
         params['prevent_quad_collisions'] = True  # EB: Fix to True
+        params['prevent_triple_collisions'] = False  # EB: Fix to False
 
         # Random wiring mode (disabled)
         params['use_density_dist'] = False
@@ -868,10 +1142,20 @@ def objective_factory(
         # Skip-consequence prob (disabled)
         params['p_skip_consequence'] = 0
 
-        # Forcing mechanism (effectively a binomial distribution)
+        # Forcing mechanism (binomial-ish)
         params['use_force_distr'] = False
-        params['p_force'] = trial.suggest_float("p_force", 0.05, 1.0, step=0.05)
-        params['n_force'] = trial.suggest_int("n_force", 1, 5)
+
+        if p_force_range is not None:
+            lo, hi, step = p_force_range
+            params['p_force'] = trial.suggest_float("p_force", lo, hi, step=step)
+        else:
+            params['p_force'] = trial.suggest_float("p_force", 0.1, 0.5, step=0.1)
+
+        if n_force_range is not None:
+            lo, hi, step = n_force_range
+            params['n_force'] = trial.suggest_int("n_force", lo, hi, step=step)
+        else:
+            params['n_force'] = trial.suggest_int("n_force", 1, 5, step=1)
 
         # Build config for this trial
         cfg = make_config_from_trial(base_config, params, export_dir, trial.number)
@@ -888,9 +1172,13 @@ def objective_factory(
             run0 = os.path.join(cfg["export_dir"], "run_0")
             if not os.path.isdir(run0):
                 run0 = cfg["export_dir"]
+
             syn_train = _read_edgelist_any(os.path.join(run0, "train.txt"))
             syn_valid = _read_edgelist_any(os.path.join(run0, "valid.txt"))
             syn_test = _read_edgelist_any(os.path.join(run0, "test.txt"))
+            # syn_train = _read_split_any(run0, "train")
+            # syn_valid = _read_split_any(run0, "valid")
+            # syn_test  = _read_split_any(run0, "test")
 
             syn_baselines = evaluate_baselines(
                 train_df=syn_train, valid_df=syn_valid, test_df=syn_test,
@@ -901,7 +1189,10 @@ def objective_factory(
             )
 
             score_core = score_metrics(syn_metrics, target, metric_weights)
-            score_base = score_baseline_similarity(syn_baselines, target_baselines) if baseline_weight > 0 else 0.0
+            score_base = (
+                score_baseline_similarity(syn_baselines, target_baselines_local)
+                if baseline_weight > 0 else 0.0
+            )
             score = float(score_core + baseline_weight * score_base)
 
             # Attach baseline results
@@ -923,7 +1214,7 @@ def objective_factory(
                 export_dir, trial.number, cfg, params, syn_metrics, score,
                 real_metrics=target,
                 syn_distributions=None,
-                real_distributions=target_distributions,
+                real_distributions=tgt_dists,
             )
             trial.set_user_attr("failed", True)
             trial.set_user_attr("error", f"{type(e).__name__}: {e}")
@@ -936,7 +1227,7 @@ def objective_factory(
             export_dir, trial.number, cfg, params, syn_metrics, score,
             real_metrics=target,
             syn_distributions=syn_distributions,
-            real_distributions=target_distributions,
+            real_distributions=tgt_dists,
         )
         with open(os.path.join(cfg['export_dir'], "syn_baselines.json"), "w") as f:
             json.dump(syn_baselines, f, indent=2)
@@ -956,7 +1247,8 @@ def objective_factory(
                 'n_ents','n_rels','n_tws','n_1_hop','n_2_hop','n_3_hop',
                 'require_unique_triples','prohibit_selfconnections',
                 'prohibit_new_consequence_relations','require_sequential_rule',
-                'prevent_quad_collisions','rnd_avg_density','p_skip_consequence'
+                'prevent_quad_collisions','prevent_triple_collisions',
+                'rnd_avg_density','p_skip_consequence'
             ] if k in cfg
         } | {
             'pat_distr_ents': params.get('_pat_distr_ents_choice'),
@@ -966,10 +1258,234 @@ def objective_factory(
 
     return objective_optuna
 
+def relabel_run_dir_in_place(run_dir: str, graph_mode: str = "tkg"):
+    """
+    Inlined, robust relabeler modeled after relabel_full_from_existing.py:
+    - Reads pattern2id + train/valid/test.txt
+    - Applies the same backtracking semantics as run.py (accelerated per-relation index)
+    - Writes train/valid/test.txt back with 'pattern' labels filled (both antecedent and consequence)
+    """
+    import numpy as np, pandas as pd
+    from temporalpattern import TemporalPattern
+    import re
+
+    # --- small helpers mirrored from relabel_full_from_existing.py ---
+    PH_RE = re.compile(r"^e\d+$")
+    def _is_ph(x): return isinstance(x, (str, np.str_)) and PH_RE.match(str(x)) is not None
+    def _norm_ph(x): return str(x) if _is_ph(x) else x
+    def _seed(mapping, key, value):
+        key = _norm_ph(key)
+        if not _is_ph(key): return True
+        v = int(value)
+        if key in mapping: return int(mapping[key]) == v
+        mapping[key] = v; return True
+    def _all_diff_ok(m): 
+        v = list(m.values()); return len(v) == len(set(v))
+    def _pattern_placeholders(ants, cons):
+        ordered = []
+        def add(x):
+            x = _norm_ph(x)
+            if _is_ph(x) and x not in ordered: ordered.append(x)
+        for h,_,ta in ants: add(h); add(ta)
+        ch,_,cta = cons; add(ch); add(cta)
+        return ordered
+    def _binding_to_str(m, placeholders):
+        return "|".join(f"{k}={int(m[k])}" for k in placeholders if k in m)
+    def _uniq_list_cell(x):
+        if isinstance(x, list): return [v for v in x if v not in (None, "", "[]")]
+        if x in (None, "", "[]"): return []
+        return [str(x)]
+
+    class RelIndex:
+        __slots__=("t","head","tail","row_idx")
+        def __init__(self, t, head, tail, row_idx):
+            order = np.argsort(t, kind="mergesort")
+            self.t = t[order]; self.head = head[order]; self.tail = tail[order]; self.row_idx = row_idx[order]
+        def window(self, t_min, t_max):
+            lo = np.searchsorted(self.t, t_min, side="left")
+            hi = np.searchsorted(self.t, t_max, side="right")
+            return lo, hi
+
+    def build_rel_index(df_all: pd.DataFrame):
+        rel2idx = {}
+        arr_rel  = df_all["rel"].to_numpy(np.int64, copy=False)
+        arr_head = df_all["head"].to_numpy(np.int64, copy=False)
+        arr_tail = df_all["tail"].to_numpy(np.int64, copy=False)
+        arr_t    = df_all["t"].to_numpy(np.int64, copy=False)
+        arr_row  = np.arange(len(df_all), dtype=np.int64)
+        for r in np.unique(arr_rel):
+            m = (arr_rel == r)
+            rel2idx[int(r)] = RelIndex(arr_t[m].copy(), arr_head[m].copy(), arr_tail[m].copy(), arr_row[m].copy())
+        return rel2idx
+
+    def candidates_for_ant(rel_index, ant, t_anchor, lag, is_kg):
+        h, r, ta = _norm_ph(ant[0]), int(ant[1]), _norm_ph(ant[2])
+        if is_kg:
+            lo, hi = 0, len(rel_index.t)
+        else:
+            min_lag, max_lag = lag
+            t_min = int(t_anchor) - int(max_lag)
+            t_max = int(t_anchor) - int(min_lag)
+            lo, hi = rel_index.window(t_min, t_max)
+            if lo >= hi: return None
+        sel = np.ones(hi - lo, dtype=bool)
+        if not _is_ph(h):  sel &= (rel_index.head[lo:hi] == int(h))
+        if not _is_ph(ta): sel &= (rel_index.tail[lo:hi] == int(ta))
+        if not np.any(sel): return None
+        return (rel_index.row_idx[lo:hi][sel],
+                rel_index.head[lo:hi][sel],
+                rel_index.tail[lo:hi][sel],
+                rel_index.t[lo:hi][sel])
+
+    def backtrack_rev_with_paths(df_all, rel2idx, ants, lags, t_anchors, step, mapping, path, is_kg):
+        n = len(ants)
+        if step == n:
+            yield mapping, path
+            return
+        orig_idx = n - 1 - step
+        ant = ants[orig_idx]; r = int(ant[1])
+        rel_index = rel2idx.get(r)
+        if rel_index is None: return
+        lag = lags[orig_idx]
+        for t_anchor in t_anchors:
+            block = candidates_for_ant(rel_index, ant, t_anchor, lag, is_kg)
+            if block is None: continue
+            idxs, heads, tails, ts = block
+            for i in range(len(idxs)):
+                new_map = dict(mapping)
+                h, ta = _norm_ph(ant[0]), _norm_ph(ant[2])
+                if _is_ph(h):
+                    if not _seed(new_map, h, heads[i]): continue
+                elif int(h) != int(heads[i]): continue
+                if _is_ph(ta):
+                    if not _seed(new_map, ta, tails[i]): continue
+                elif int(ta) != int(tails[i]): continue
+                if not _all_diff_ok(new_map): continue
+                new_path = path + [(orig_idx, int(idxs[i]))]
+                yield from backtrack_rev_with_paths(df_all, rel2idx, ants, lags, [int(ts[i])], step+1, new_map, new_path, is_kg)
+
+    is_kg = (str(graph_mode).lower() == "kg")
+    pat_path = os.path.join(run_dir, "pattern2id.txt")
+    tr_path  = os.path.join(run_dir, "train.txt")
+    va_path  = os.path.join(run_dir, "valid.txt")
+    te_path  = os.path.join(run_dir, "test.txt")
+    for p in (pat_path, tr_path, va_path, te_path):
+        if not os.path.exists(p): raise FileNotFoundError(f"Missing: {p}")
+
+    pat_df = pd.read_csv(pat_path, sep="\t", header=None, names=["pattern","n_hops","id"])
+    splits = []
+    for p in (tr_path, va_path, te_path):
+        df = pd.read_csv(p, sep="\t", header=None,
+                         names=["head","rel","tail","t","wt","pattern"],
+                         dtype={"head":np.int64,"rel":np.int64,"tail":np.int64,"t":np.int64,"wt":float,"pattern":object})
+        df["pattern"] = df["pattern"].apply(_uniq_list_cell)
+        splits.append(df)
+    df_all = pd.concat(splits, ignore_index=True)
+
+    rel2idx = build_rel_index(df_all)
+
+    for _, row in pat_df.iterrows():
+        pid = int(row["id"])
+        tp = TemporalPattern(); tp.from_label(row["pattern"])
+
+        raw_ants = list(tp.antecedent)
+        ants = [(_norm_ph(h), r, _norm_ph(ta)) for (h, r, ta) in raw_ants]
+        ch, cr, cta = tp.consequence
+        cons_h, cons_r, cons_ta = _norm_ph(ch), int(cr), _norm_ph(cta)
+        lags = list(tp.time_lags)
+
+        placeholders = _pattern_placeholders(ants, (cons_h, cons_r, cons_ta))
+        same_ph_cons = (_is_ph(cons_h) and _is_ph(cons_ta) and cons_h == cons_ta)
+
+        mask = (df_all["rel"].to_numpy() == cons_r)
+        if not _is_ph(cons_h):  mask &= (df_all["head"].to_numpy() == int(cons_h))
+        if not _is_ph(cons_ta): mask &= (df_all["tail"].to_numpy() == int(cons_ta))
+        if same_ph_cons:        mask &= (df_all["head"].to_numpy() == df_all["tail"].to_numpy())
+
+        cand_idx = np.nonzero(mask)[0]
+        if cand_idx.size == 0:
+            continue
+
+        sub = df_all.iloc[cand_idx]
+        grp_keys = np.core.records.fromarrays(
+            (sub["head"].to_numpy(), sub["tail"].to_numpy(), sub["t"].to_numpy()),
+            names="h,tail,t"
+        )
+        order = np.argsort(grp_keys, kind="mergesort")
+        grp_keys = grp_keys[order]
+        grp_idx_sorted = cand_idx[order]
+        bounds = np.flatnonzero(np.r_[True, grp_keys[1:] != grp_keys[:-1], True])
+
+        for b0, b1 in zip(bounds[:-1], bounds[1:]):
+            rows = grp_idx_sorted[b0:b1]
+            h_val = int(df_all.at[rows[0], "head"])
+            ta_val = int(df_all.at[rows[0], "tail"])
+            t_anchor = 0 if is_kg else int(df_all.at[rows[0], "t"])
+
+            init_map = {}
+            if same_ph_cons:
+                if not _seed(init_map, cons_h, h_val): continue
+            else:
+                if _is_ph(cons_h)  and not _seed(init_map, cons_h,  h_val): continue
+                if _is_ph(cons_ta) and not _seed(init_map, cons_ta, ta_val): continue
+            if not _all_diff_ok(init_map): continue
+
+            if len(ants) == 0:
+                bind_str = _binding_to_str(init_map, placeholders)
+                lab_c = f"{pid}_c_{bind_str}"
+                for ridx in rows:
+                    cell = df_all.at[ridx, "pattern"]
+                    if lab_c not in cell:
+                        cell.append(lab_c); df_all.at[ridx, "pattern"] = cell
+                continue
+
+            for mapping, path in backtrack_rev_with_paths(df_all, rel2idx, ants, lags, [t_anchor], 0, init_map, [], is_kg):
+                exp_h = mapping[cons_h] if _is_ph(cons_h) else cons_h
+                exp_t = mapping[cons_ta] if _is_ph(cons_ta) else cons_ta
+                if (h_val != int(exp_h)) or (ta_val != int(exp_t)):
+                    continue
+                bind_str = _binding_to_str(mapping, placeholders)
+
+                seen = set()
+                for ante_idx, edge_idx in path:
+                    if edge_idx in rows:  # never both consequence+antecedent
+                        continue
+                    ah, ar, at = ants[ante_idx]
+                    ahv = mapping[_norm_ph(ah)] if _is_ph(_norm_ph(ah)) else _norm_ph(ah)
+                    atv = mapping[_norm_ph(at)] if _is_ph(_norm_ph(at)) else _norm_ph(at)
+                    if not (int(df_all.at[edge_idx,"head"]) == int(ahv)
+                            and int(df_all.at[edge_idx,"rel"]) == int(ar)
+                            and int(df_all.at[edge_idx,"tail"]) == int(atv)):
+                        continue
+                    lab_a = f"{pid}_a{ante_idx}_{bind_str}"
+                    if lab_a in seen:  # avoid duplicate role/bind
+                        continue
+                    cell = df_all.at[edge_idx, "pattern"]
+                    if lab_a not in cell:
+                        cell.append(lab_a); df_all.at[edge_idx, "pattern"] = cell
+                    seen.add(lab_a)
+
+                lab_c = f"{pid}_c_{bind_str}"
+                for ridx in rows:
+                    cell = df_all.at[ridx, "pattern"]
+                    if lab_c not in cell:
+                        cell.append(lab_c); df_all.at[ridx, "pattern"] = cell
+
+    # Write back splits
+    n_tr, n_va, n_te = (len(splits[0]), len(splits[1]), len(splits[2]))
+    def _write(path, frame): frame.to_csv(path, sep="\t", index=False, header=False)
+    start = 0
+    tr_out = df_all.iloc[start:start+n_tr]; start += n_tr
+    va_out = df_all.iloc[start:start+n_va]; start += n_va
+    te_out = df_all.iloc[start:start+n_te]
+    _write(os.path.join(run_dir, "train.txt"), tr_out)
+    _write(os.path.join(run_dir, "valid.txt"), va_out)
+    _write(os.path.join(run_dir, "test.txt"),  te_out)
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref_tkg_dir", required=True, help="Path to reference TKG folder with train/valid/test.txt")
+    ap.add_argument("--ref_tkg_dir", required=False, help="Path to reference TKG folder with train/valid/test.txt")
     ap.add_argument("--budget", type=int, default=20, help="Number of datasets (trials) to generate")
     ap.add_argument("--export_root", default="opt_runs", help="Where to write trial results")
     ap.add_argument("--base_config", default=None,
@@ -1000,12 +1516,91 @@ def main():
                     help="(Optional) Optuna storage URL for multi-process parallelism (e.g. 'sqlite:///path/to/optuna.db').")
     ap.add_argument("--study_name", default="tkg_opt",
                     help="Study name (used only if --storage is provided).")
+    # Directly passing target metrics/baselines
+    ap.add_argument(
+        "--target_metrics",
+        default="",
+        help="JSON dict or path to JSON file with target descriptive metrics (keys: n_ents, n_rels, n_tws, n_quads, n_unique_triples, avg_degree, deg_p25, deg_p75)."
+    )
+    ap.add_argument(
+        "--target_baselines",
+        default="",
+        help="JSON dict or path to JSON file with target recency/frequency Hits@K baselines."
+    )
+    # Search space parameters
+    ap.add_argument(
+        "--n_1_hop_range",
+        default="25:350:25",
+        help="min:max:step for n_1_hop search space"
+    )
+    ap.add_argument(
+        "--n_2_hop_range",
+        default="25:250:25",
+        help="min:max:step for n_2_hop search space"
+    )
+    ap.add_argument(
+        "--n_3_hop_range",
+        default="25:200:25",
+        help="min:max:step for n_3_hop search space"
+    )
+    ap.add_argument(
+        "--p_force_range",
+        default="0.1:0.5:0.1",
+        help="min:max:step for p_force search space"
+    )
+    ap.add_argument(
+        "--n_force_range",
+        default="1:5:1",
+        help="min:max:step for n_force search space"
+    )
+    ap.add_argument(
+        "--lag_profile",
+        default="u1_3",
+        choices=list(LAG_PROFILE_MENU.keys()),
+        help="Name of lag profile to use for 1/2/3-hop time_lag_* entries"
+    )
+    ap.add_argument(
+        "--pat_distr_ents_choices",
+        default="",
+        help="Comma-separated menu of pat_distr_ents choices to allow (subset of the built-in menu). Empty = full menu."
+    )
+    ap.add_argument(
+        "--pat_distr_rels_choices",
+        default="",
+        help="Comma-separated menu of pat_distr_rels choices. Empty = same as ents."
+    )
+
     
     args = ap.parse_args()
 
     def _parse_int_list(s):
         s = (s or "").strip()
         return [int(x) for x in s.split(",") if x.strip().isdigit()]
+    
+    def _parse_range(spec, cast):
+        spec = (spec or "").strip()
+        if not spec:
+            return None
+        parts = spec.split(":")
+        if len(parts) != 3:
+            raise ValueError(f"Bad range spec '{spec}', expected 'min:max:step'")
+        lo, hi, step = cast(parts[0]), cast(parts[1]), cast(parts[2])
+        return lo, hi, step
+    
+    def _parse_choice_list(s):
+        s = (s or "").strip()
+        if not s:
+            return []
+        return [x.strip() for x in s.split() if x.strip()]
+    
+    target_metrics_cli = _load_json_arg(args.target_metrics)
+    target_baselines_cli = _load_json_arg(args.target_baselines)
+
+    if not args.ref_tkg_dir and target_metrics_cli is None:
+        raise ValueError(
+            "You must provide either --ref_tkg_dir or --target_metrics (or both). "
+            "Without a reference TKG you need explicit target metrics."
+        )
 
     recency_k_list = _parse_int_list(args.recency_k)
     frequency_k_list = _parse_int_list(args.frequency_k)
@@ -1033,6 +1628,7 @@ def main():
         'prohibit_new_consequence_relations': True,
         'require_sequential_rule': False,
         'prevent_quad_collisions': True,
+        'prevent_triple_collisions': True,
         'max_instantiation_resamples': 20,
         'n_3_hop': 10,
         # Defined here
@@ -1061,6 +1657,12 @@ def main():
         'n_hops2n_force_distr': {1: None, 2: None, 3: None},
     }
 
+    # Adjust time lags
+    lag_profile = args.lag_profile
+    base_config["time_lag_1_hop"] = build_time_lag_list(1, lag_profile)
+    base_config["time_lag_2_hop"] = build_time_lag_list(2, lag_profile)
+    base_config["time_lag_3_hop"] = build_time_lag_list(3, lag_profile)
+
     # Optional JSON override for base
     if args.base_config:
         with open(args.base_config, "r") as fh:
@@ -1075,10 +1677,18 @@ def main():
     metric_weights = None
     if args.weights:
         metric_weights = json.loads(args.weights)
+    
+    # Search space parameters
+    n1_range = _parse_range(args.n_1_hop_range, int)
+    n2_range = _parse_range(args.n_2_hop_range, int)
+    n3_range = _parse_range(args.n_3_hop_range, int)
+    p_force_range = _parse_range(args.p_force_range, float)
+    n_force_range = _parse_range(args.n_force_range, int)
+    pat_ents_choices_cli = _parse_choice_list(args.pat_distr_ents_choices)
+    pat_rels_choices_cli = _parse_choice_list(args.pat_distr_rels_choices)
 
     objective_optuna = objective_factory(
         base_config=base_config,
-        ref_tkg_dir=args.ref_tkg_dir,
         export_dir=args.export_root,
         metric_weights=metric_weights or None,
         recency_k_list=recency_k_list,
@@ -1087,6 +1697,16 @@ def main():
         baseline_weight=float(args.baseline_weight),
         baseline_max_queries_ref=args.baseline_max_queries_ref,
         baseline_max_queries_syn=args.baseline_max_queries_syn,
+        ref_tkg_dir=args.ref_tkg_dir,
+        target_metrics=target_metrics_cli,
+        target_baselines=target_baselines_cli,
+        n1_range=n1_range,
+        n2_range=n2_range,
+        n3_range=n3_range,
+        p_force_range=p_force_range,
+        n_force_range=n_force_range,
+        pat_ents_choices_cli=pat_ents_choices_cli,
+        pat_rels_choices_cli=pat_rels_choices_cli,
     )
 
     # Create sampler
@@ -1134,21 +1754,14 @@ def main():
     # If we skipped labeling, rerun the best trial with labeling on
     if args.skip_labeling:
         try:
-            print("\n[post] Re-running best trial with labeling enabled...")
-            best_params = dict(study.best_trial.params)
-
-            labeled_cfg = rehydrate_config_for_labeled_pass(
-                base_cfg=base_config,
-                best_params=best_params,
-                ref_tkg_dir=args.ref_tkg_dir,
-                export_root=args.export_root,
-                trial_id=study.best_trial.number,
-            )
-
-            generate_one(labeled_cfg, run_id=0)
-            print(f"[post] Labeled best trial written to: {labeled_cfg['export_dir']}")
+            print("\n[post] Relabeling best trial in place (robust path)...")
+            best_dir = os.path.join(args.export_root, "best_trial")
+            relabel_run_dir_in_place(best_dir, graph_mode="tkg")
+            # Optionally copy to an explicit labeled folder
+            # shutil.copytree(best_dir, os.path.join(args.export_root, "best_trial_labeled"), dirs_exist_ok=True)
+            print(f"[post] Relabeling complete: {best_dir}")
         except Exception as e:
-            print(f"[post][WARN] Failed to produce labeled best trial: {e}", file=sys.stderr)
+            print(f"[post][WARN] Failed to relabel best trial: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -1156,37 +1769,16 @@ if __name__ == "__main__":
 
 """
 Run commands:
-# INPROG ckg08
-python3 optimize_tkg.py \
-    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
-    --budget 400 \
-    --skip_labeling \
-    --recency_k '1,3,10' \
-    --frequency_k '1,3,10' \
-    --history_len '3,10' \
-    --baseline_weight 10.0 \
-    --export_root opt_runs_icews14_20251022
-
-# INPROG ckg05
+# DONE ckg05
 python3 optimize_tkg.py \
     --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS14 \
     --budget 800 \
     --skip_labeling \
     --recency_k '1,3,10' \
     --frequency_k '1,3,10' \
-    --history_len '3,10' \
-    --baseline_weight 1000.0 \
-    --export_root opt_runs_icews14_20251022_bw1000
-
-# DONE
-python3 optimize_tkg.py \
-    --ref_tkg_dir /nas/ckgfs/users/eboxer/TKG-Forecasting-Evaluation/data/ICEWS18 \
-    --budget 200 \
-    --recency_k '1,3,10' \
-    --frequency_k '1,3,10' \
-    --history_len '3,10' \
-    --baseline_weight 1.0 \
-    --export_root opt_runs_icews18_20250926
+    --history_len '1,3,10' \
+    --baseline_weight 10.0 \
+    --export_root opt_runs_icews14_20251110
 
 # Interrupted early
 python3 optimize_tkg.py \
@@ -1204,5 +1796,4 @@ python3 optimize_tkg.py \
 
 Use --weights to emphasize certain metrics, e.g.:
 --weights '{"n_ents":2,"n_rels":2,"n_quads":3,"avg_degree":3,"deg_p25":1,"deg_p75":1,"n_tws":1,"n_unique_triples":1}'
-
 """

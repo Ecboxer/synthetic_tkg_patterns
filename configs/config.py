@@ -67,6 +67,10 @@ configs = [
         # instantiations of patterns that would lead to such collisions, so this doesn't bias the TKG generation,
         # just produce simpler, less noisy TKGs.
         'prevent_quad_collisions': True,
+        # Prevent triples (h, r, o) from being attributed to multiple patterns. We do this by preventing
+        # instantiations of patterns that would lead to such collisions, so this doesn't bias the TKG generation,
+        # just produce simpler, less noisy TKGs.
+        'prevent_triple_collisions': True,
         # Maximum number of times to try to resample a pattern for instantiation, to prevent quadruple collision
         'max_instantiation_resamples': 20,
         # Number of 3-hop patterns

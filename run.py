@@ -37,7 +37,7 @@ def _rng_from_seed(seed):
     return seed if isinstance(seed, np.random.RandomState) else np.random.RandomState(seed)
 
 def _read_edgelist_any(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", header=None, dtype=str, engine="python")
+    df = pd.read_csv(path, sep="\t", header=None, dtype=str) #, engine="python")
     if df.shape[1] < 4:
         raise ValueError(f"File {path} must have at least 4 columns.")
     df = df.iloc[:, :4].copy()
@@ -475,6 +475,9 @@ def run(config: 'Dict[str,]', run_id: int):
     # Recognize KG mode
     IS_KG = (str(config.get('graph_mode', 'tkg')).lower() == 'kg')
 
+    # Prevent triple collision
+    PREVENT_TRIPLE = bool(config.get('prevent_triple_collisions', False))
+
     def dbg(*args, **kwargs):
         if DEBUG:
             print(*args, **kwargs)
@@ -774,34 +777,57 @@ def run(config: 'Dict[str,]', run_id: int):
         # canonical 4-tuple for the collision set
         return (int(h), int(r), int(t), int(ts))
     
+    def _triple_tuple(h, r, t):
+        return (int(h), int(r), int(t))
+    
     def _reserve_if_free(quads, owner_tag):
+        """ Try to reserve a batch of edges atomically.
+        - If any *quadruple* collides (and prevent_quad_collisions=True) -> fail.
+        - If any *triple* collides (and prevent_triple_collisions=True) -> fail.
+        On success, reserve all and return True.
         """
-        Try to reserve a batch of quads. If any collide, do nothing and return False.
-        If all are free, reserve all and return True.
-        """
+        # Fast pre-checks
+        if config.get('prevent_quad_collisions', True):
+            for q in quads:
+                if q in existing_quads:
+                    return False
+        if PREVENT_TRIPLE:
+            for (h, r, ta, _ts) in quads:
+                if _triple_tuple(h, r, ta) in existing_triples:
+                    return False
+
+        # Commit both quad and triple reservations
         for q in quads:
-            if q in existing_quads:
-                return False
-        for q in quads:
-            existing_quads.add(q)
-            quad_owner[q] = owner_tag
+            if config.get('prevent_quad_collisions', True):
+                existing_quads.add(q)
+                if q not in quad_owner:
+                    quad_owner[q] = owner_tag
+            if PREVENT_TRIPLE:
+                h, r, ta, _ts = q
+                tt = _triple_tuple(h, r, ta)
+                existing_triples.add(tt)
+                if tt not in triple_owner:
+                    triple_owner[tt] = owner_tag
         return True
     
-    # global set for *all* existing quads (random wiring, antecedents, consequences)
+    # Global set for *all* existing quads (random wiring, antecedents, consequences)
     existing_quads = set()
+    # Simple owner map, (h,r,t,ts) -> 'rand' or f'pid:{pattern_id}'
+    quad_owner = {}
 
-    # simple owner map
-    quad_owner = {}  # (h,r,t,ts) -> 'rand' or f'pid:{pattern_id}'
+    # For triples
+    existing_triples = set()
+    triple_owner = {}
 
     def _owner_for(h, r, t, ts):
         return quad_owner.get(_quad_tuple(h, r, t, ts))
 
-    # per-pattern diagnostics
+    # Per-pattern diagnostics
     collide_skips = defaultdict(int)
     collide_tries = defaultdict(list)  # list of #resamples taken for successes
 
     def _register_df_quads(df, owner_tag):
-        # register a dataframe of edges into the collision set
+        # Register a dataframe of edges into the collision set
         if df is None or df.empty:
             return
         for h, r, t, ts in df[['head', 'rel', 'tail', 't']].itertuples(index=False, name=None):
@@ -812,11 +838,23 @@ def run(config: 'Dict[str,]', run_id: int):
             # DO NOT overwrite a prior reservation (e.g., 'pid:...|bind:...')
             if q not in quad_owner:
                 quad_owner[q] = owner_tag
+            if PREVENT_TRIPLE:
+                tt = _triple_tuple(h, r, t)
+                if tt not in existing_triples:
+                    existing_triples.add(tt)
+                if tt not in triple_owner:
+                    triple_owner[tt] = owner_tag
 
     def _would_collide(h, r, t, ts):
-        if not config.get('prevent_quad_collisions', True):
-            return False
-        return _quad_tuple(h, r, t, ts) in existing_quads
+        quad_hit = (
+            config.get('prevent_quad_collisions', True) and
+            _quad_tuple(h, r, t, ts) in existing_quads
+        )
+        triple_hit = (
+            PREVENT_TRIPLE and
+            _triple_tuple(h, r, t) in existing_triples
+        )
+        return quad_hit or triple_hit
     
     # Get run-specific seed
     if config['seed'] is not None:
@@ -1527,13 +1565,24 @@ def run(config: 'Dict[str,]', run_id: int):
         'wt',
         'pattern',
     ]
+    # For internal edge lists (including antecedent/consequence flags)
+    # cols_meta = cols_export + ['is_antecedent','is_consequence']
+
     train_df[cols_export].to_csv(
         os.path.join(export_dir, 'train.txt'), sep='\t', index=False, header=False)
     valid_df[cols_export].to_csv(
         os.path.join(export_dir, 'valid.txt'), sep='\t', index=False, header=False)
     test_df[cols_export].to_csv(
         os.path.join(export_dir, 'test.txt'), sep='\t', index=False, header=False)
-        
+    
+    # Also write meta copies with flags (for optimize_tkg.py to use)
+    # train_df[cols_meta].to_csv(
+    #     os.path.join(export_dir, 'train.meta.tsv'), sep='\t', index=False)
+    # valid_df[cols_meta].to_csv(
+    #     os.path.join(export_dir, 'valid.meta.tsv'), sep='\t', index=False)
+    # test_df[cols_meta].to_csv(
+    #     os.path.join(export_dir, 'test.meta.tsv'),  sep='\t', index=False)
+
     # Write config to export directory, for reproducibility
     dump_config_snapshot(export_dir, config)
 
@@ -1614,7 +1663,7 @@ if __name__ == "__main__":
         else:
             all_cfgs.extend(cfgs_here)
 
-    # Run each config’s runs in parallel as you already do
+    # Run each config’s runs in parallel
     for cfg in all_cfgs:
         n_runs = int(cfg["n_runs"])
         n_jobs = int(args.jobs_per_config or cfg["n_jobs"])
