@@ -1,0 +1,98 @@
+{
+  "graph_mode": "tkg",
+  "seed": 0,
+  "debug": false,
+  "split": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "split_on": "consequence_only",
+  "fast_force_consequence": true,
+  "skip_generation_matcher": true,
+  "n_ents": 1800,
+  "n_rels": 80,
+  "n_tws": 180,
+  "require_unique_triples": true,
+  "prohibit_selfconnections": false,
+  "prohibit_new_consequence_relations": false,
+  "require_sequential_rule": false,
+  "prevent_quad_collisions": true,
+  "prevent_triple_collisions": false,
+  "max_instantiation_resamples": 20,
+  "max_retries": 3,
+  "rnd_avg_density": 0.0,
+  "rnd_avg_density_distr": null,
+  "p_skip_consequence": 0.0,
+  "n_runs": 5,
+  "n_jobs": 5,
+  "export_dir": "mw_dist_Eunif_Runif",
+  "n_1_hop": 0,
+  "n_2_hop": 150,
+  "n_3_hop": 0,
+  "time_lag_1_hop": [
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ]
+  ],
+  "time_lag_2_hop": [
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ]
+  ],
+  "time_lag_3_hop": [
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ],
+    [
+      1,
+      {
+        "__callable__": "f",
+        "repr": "def f(seed=None):\n        rng = _rng_from_seed(seed)\n        # randint high is exclusive; add 1\n        return int(rng.randint(lo, hi + 1))"
+      }
+    ]
+  ],
+  "n_hops2p_force": {
+    "1": 0,
+    "2": 0.26666666666666666,
+    "3": 0
+  },
+  "n_hops2n_force": {
+    "1": 0,
+    "2": 1,
+    "3": 0
+  },
+  "n_hops2n_force_distr": {
+    "1": null,
+    "2": null,
+    "3": null
+  },
+  "pat_distr_ents": null,
+  "pat_distr_rels": null
+}
